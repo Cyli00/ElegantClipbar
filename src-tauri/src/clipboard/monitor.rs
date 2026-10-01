@@ -454,7 +454,12 @@ fn read_clipboard_content_inner(
     // ── 4. 按语义决定类型 ──
     // Word/WPS/浏览器等复制富文本时会同时放 CF_DIB（文字位图预览），
     // 此时应优先作为富文本存储，而非图片。
-    if has_text {
+    // 例外：浏览器“复制图片”只带一段单图 HTML（无任何文字），仍按图片处理。
+    let image_only_html = image_result.is_some()
+        && rtf.is_none()
+        && text.is_none()
+        && html.as_deref().is_some_and(is_image_only_html);
+    if has_text && !image_only_html {
         if let Some(html) = html {
             debug!(
                 "Got HTML from clipboard: {} bytes, rtf={}, text={}",
@@ -483,6 +488,37 @@ fn read_clipboard_content_inner(
 
     debug!("No recognizable content in clipboard");
     None
+}
+
+/// HTML 片段是否只含图片、没有任何可见文字（浏览器“复制图片”的典型形态）。
+/// 有 StartFragment/EndFragment 标记时只看标记之间的内容。
+fn is_image_only_html(html: &str) -> bool {
+    const START: &str = "<!--StartFragment-->";
+    const END: &str = "<!--EndFragment-->";
+    let fragment = match (html.find(START), html.find(END)) {
+        (Some(s), Some(e)) if s + START.len() <= e => &html[s + START.len()..e],
+        _ => html,
+    };
+
+    let mut has_img = false;
+    let mut rest = fragment;
+    while let Some(lt) = rest.find('<') {
+        if !rest[..lt].trim().is_empty() {
+            return false;
+        }
+        let Some(gt) = rest[lt..].find('>') else {
+            return false;
+        };
+        let tag = rest[lt + 1..lt + gt].trim_start();
+        let name_len = tag
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(tag.len());
+        if tag[..name_len].eq_ignore_ascii_case("img") {
+            has_img = true;
+        }
+        rest = &rest[lt + gt + 1..];
+    }
+    has_img && rest.trim().is_empty()
 }
 
 /// 将剪贴板图片编码为 PNG 写入临时文件，避免大 Vec 在 channel/worker 间传递
@@ -546,4 +582,60 @@ fn read_rtf_from_context(ctx: &ClipboardContext) -> Option<String> {
         return None;
     }
     Some(super::rtf_storage::encode_rtf_for_storage(&bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_image_only_html;
+
+    #[test]
+    fn single_image_fragment() {
+        let html = r#"<html><body><!--StartFragment--><img src="https://example.invalid/a.png" alt="image"><!--EndFragment--></body></html>"#;
+        assert!(is_image_only_html(html));
+    }
+
+    #[test]
+    fn image_without_fragment_markers() {
+        assert!(is_image_only_html(
+            r#"<html><body><img src="a.png"/></body></html>"#
+        ));
+        assert!(is_image_only_html(r#"<IMG SRC="a.png">"#));
+    }
+
+    #[test]
+    fn image_wrapped_in_link() {
+        let html = r#"<!--StartFragment--><a href="x"><img src="a.png"></a><!--EndFragment-->"#;
+        assert!(is_image_only_html(html));
+    }
+
+    #[test]
+    fn image_with_text_is_rich_text() {
+        let html = r#"<html><body><!--StartFragment--><p>说明</p><img src="a.png"><!--EndFragment--></body></html>"#;
+        assert!(!is_image_only_html(html));
+        let trailing = r#"<!--StartFragment--><img src="a.png"> caption<!--EndFragment-->"#;
+        assert!(!is_image_only_html(trailing));
+    }
+
+    #[test]
+    fn text_only_or_empty_is_not_image() {
+        assert!(!is_image_only_html(
+            "<!--StartFragment--><b>hi</b><!--EndFragment-->"
+        ));
+        assert!(!is_image_only_html(
+            "<!--StartFragment--><!--EndFragment-->"
+        ));
+        assert!(!is_image_only_html(""));
+    }
+
+    #[test]
+    fn tag_names_starting_with_img_are_not_images() {
+        assert!(!is_image_only_html(
+            "<!--StartFragment--><imgx src=a><!--EndFragment-->"
+        ));
+    }
+
+    #[test]
+    fn unclosed_tag_is_not_image() {
+        assert!(!is_image_only_html(r#"<img src="a.png""#));
+    }
 }
