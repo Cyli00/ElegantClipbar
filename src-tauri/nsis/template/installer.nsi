@@ -17,6 +17,7 @@ ManifestDPIAwareness PerMonitorV2
 !include FileFunc.nsh
 !include x64.nsh
 !include WordFunc.nsh
+!include "Win\RestartManager.nsh"
 !include "utils.nsh"
 !include "FileAssociation.nsh"
 !include "Win\COM.nsh"
@@ -620,7 +621,7 @@ Section Install
     !insertmacro NSIS_HOOK_PREINSTALL
   !endif
 
-  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
   ; Copy main executable
   File "${MAINBINARYSRCPATH}"
@@ -757,7 +758,7 @@ Section Uninstall
     !insertmacro NSIS_HOOK_PREUNINSTALL
   !endif
 
-  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
   ; Delete the app directory and its content from disk
   ; Copy main executable
