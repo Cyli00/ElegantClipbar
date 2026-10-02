@@ -48,3 +48,7 @@ manifests/
 
 # Codegraph
 .codegraph/
+
+# Native macOS build output
+.build/
+build/
