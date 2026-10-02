@@ -102,10 +102,26 @@ fn file_name_from_any_path(path: &str) -> Option<String> {
 /// 校验媒体文件名，拒绝路径分隔符与 `..` 组件
 fn safe_media_file_name(name: &str) -> Option<String> {
     let trimmed = name.trim();
-    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+    if trimmed.is_empty() || trimmed.ends_with(['.', ' ']) {
         return None;
     }
-    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
+    if trimmed.contains("..")
+        || trimmed
+            .chars()
+            .any(|c| c.is_control() || "/\\:<>\"|?*".contains(c))
+    {
+        return None;
+    }
+    let stem = trimmed.split('.').next()?;
+    if ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|name| stem.eq_ignore_ascii_case(name))
+        || (stem.len() == 4
+            && stem.get(..3).is_some_and(|prefix| {
+                prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT")
+            })
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+    {
         return None;
     }
     Some(trimmed.to_string())
@@ -116,7 +132,13 @@ fn safe_media_file_name(name: &str) -> Option<String> {
 /// 写入位置完全由本机数据目录 + 内容 hash 构造，与来源设备的路径无关，
 /// 因此跨设备同步不再依赖两端目录一致。
 pub fn local_media_target(entry: &MediaEntry, data_dir: &Path) -> Option<PathBuf> {
-    if entry.hash.is_empty() {
+    if entry.hash.len() != 64
+        || !entry.hash.bytes().all(|b| b.is_ascii_hexdigit())
+        || !entry
+            .ext
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
         return None;
     }
     match entry.media_type.as_str() {
@@ -143,7 +165,7 @@ pub fn local_media_target(entry: &MediaEntry, data_dir: &Path) -> Option<PathBuf
             } else {
                 safe_media_file_name(&entry.file_name)?
             };
-            let prefix = &entry.hash[..16.min(entry.hash.len())];
+            let prefix = &entry.hash[..16];
             Some(
                 data_dir
                     .join("staged")
@@ -1127,7 +1149,7 @@ pub fn upload_media_map(
     local_entries: &[MediaEntry],
     device_id: &str,
 ) -> Result<Vec<MediaEntry>, String> {
-    let mut map = download_media_map(config).unwrap_or_default();
+    let mut map = download_media_map(config)?;
 
     let local_hashes: std::collections::HashSet<&str> =
         local_entries.iter().map(|e| e.hash.as_str()).collect();
@@ -1598,8 +1620,19 @@ pub fn start_auto_sync_task(
                                         .store(true, std::sync::atomic::Ordering::Relaxed);
 
                                     let device_id = get_or_create_device_id(&db);
-                                    let local_items =
-                                        query_sync_items(&db, &options).unwrap_or_default();
+                                    let local_items = match query_sync_items(&db, &options) {
+                                        Ok(items) => items,
+                                        Err(e) => {
+                                            warn!("读取本地媒体失败，跳过同步和清理: {}", e);
+                                            MEDIA_SYNC_RUNNING
+                                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                                            drop(guard);
+                                            std::thread::sleep(std::time::Duration::from_secs(
+                                                interval_secs.max(1),
+                                            ));
+                                            continue;
+                                        }
+                                    };
                                     let (local_map, _) = build_media_map(
                                         &local_items,
                                         &data_dir,
@@ -1607,11 +1640,7 @@ pub fn start_auto_sync_task(
                                         &device_id,
                                     );
 
-                                    let merged_map = if local_map.is_empty() {
-                                        let map = download_media_map(&config).unwrap_or_default();
-                                        let _ = cleanup_orphaned_remote_media(&config, &map);
-                                        map
-                                    } else {
+                                    let merged_map =
                                         match upload_media_map(&config, &local_map, &device_id) {
                                             Ok(map) => {
                                                 let _ =
@@ -1619,11 +1648,10 @@ pub fn start_auto_sync_task(
                                                 map
                                             }
                                             Err(e) => {
-                                                info!("上传 media map 失败，跳过清理: {}", e);
+                                                warn!("上传 media map 失败，跳过清理: {}", e);
                                                 Vec::new()
                                             }
-                                        }
-                                    };
+                                        };
 
                                     let local_images: Vec<MediaEntry> = local_map
                                         .iter()
@@ -1961,7 +1989,7 @@ mod tests {
 
     fn media_entry(media_type: &str, local_path: &str, hash: &str) -> MediaEntry {
         MediaEntry {
-            hash: hash.to_string(),
+            hash: blake3::hash(hash.as_bytes()).to_hex().to_string(),
             ext: "png".to_string(),
             media_type: media_type.to_string(),
             local_path: local_path.to_string(),
@@ -2010,7 +2038,9 @@ mod tests {
         let target = local_media_target(&entry, Path::new("D:\\data")).unwrap();
         assert_eq!(
             target,
-            Path::new("D:\\data").join("images").join("abc123.png")
+            Path::new("D:\\data")
+                .join("images")
+                .join(format!("{}.png", entry.hash))
         );
     }
 
@@ -2034,7 +2064,7 @@ mod tests {
             Path::new("E:\\app")
                 .join("staged")
                 .join("webdav")
-                .join("aabbccddeeff0011_report.zip")
+                .join(format!("{}_report.zip", &entry.hash[..16]))
         );
     }
 
@@ -2042,12 +2072,17 @@ mod tests {
     fn media_target_file_falls_back_to_local_path_name() {
         let entry = media_entry("file", "D:\\Downloads\\notes.txt", "hash1234");
         let target = local_media_target(&entry, Path::new("E:\\app")).unwrap();
-        assert!(target.to_string_lossy().ends_with("hash1234_notes.txt"));
+        assert!(
+            target
+                .to_string_lossy()
+                .ends_with(&format!("{}_notes.txt", &entry.hash[..16]))
+        );
     }
 
     #[test]
     fn media_target_rejects_empty_hash() {
-        let entry = media_entry("image", "a.png", "");
+        let mut entry = media_entry("image", "a.png", "content");
+        entry.hash.clear();
         assert!(local_media_target(&entry, Path::new("D:\\data")).is_none());
     }
 
@@ -2116,7 +2151,11 @@ mod tests {
         assert!(changed);
         assert_eq!(
             item.image_path.as_deref().map(std::path::PathBuf::from),
-            Some(Path::new("D:\\data").join("images").join("hash1.png"))
+            Some(
+                Path::new("D:\\data")
+                    .join("images")
+                    .join(format!("{}.png", map[0].hash))
+            )
         );
     }
 
@@ -2141,7 +2180,11 @@ mod tests {
         assert_eq!(payload.staged[0].original, "C:\\other-device\\doc.pdf");
         assert_eq!(payload.staged[0].size, 42);
         assert!(payload.staged[0].staged.contains("staged"));
-        assert!(payload.staged[0].staged.ends_with("hash2_doc.pdf"));
+        assert!(
+            payload.staged[0]
+                .staged
+                .ends_with(&format!("{}_doc.pdf", &map[0].hash[..16]))
+        );
     }
 
     #[test]
@@ -2391,7 +2434,7 @@ mod tests {
 
     #[test]
     fn prune_media_map_drops_unreferenced_entries() {
-        let items = vec![make_item(1, "text")];
+        let items = [make_item(1, "text")];
         let map = vec![
             media_entry("image", "orphan.png", "hash_orphan"),
             media_entry("image", "keep.png", "hash_keep"),
@@ -2501,5 +2544,134 @@ mod tests {
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn media_target_rejects_untrusted_path_components() {
+        let root = Path::new("C:\\clipboard-data");
+        for media_type in ["image", "file", "icon"] {
+            let mut entry = media_entry(media_type, "remote.png", "content");
+            for hash in ["", "../escape", "C:\\escape", "汉汉汉汉汉汉", "abcd"] {
+                entry.hash = hash.into();
+                assert!(
+                    local_media_target(&entry, root).is_none(),
+                    "{media_type}: {hash}"
+                );
+            }
+            entry.hash = "a".repeat(64);
+            for ext in [
+                "../exe",
+                "png/escape",
+                "png\\escape",
+                "png:stream",
+                "png?path",
+            ] {
+                entry.ext = ext.into();
+                assert!(
+                    local_media_target(&entry, root).is_none(),
+                    "{media_type}: {ext}"
+                );
+            }
+        }
+        for name in [
+            "../evil",
+            "C:\\evil",
+            "evil:stream",
+            "CON",
+            "nul.txt",
+            "COM1.txt",
+            "name.",
+        ] {
+            let mut file = media_entry("file", "remote.txt", "content");
+            file.file_name = name.into();
+            assert!(local_media_target(&file, root).is_none(), "{name}");
+        }
+        let mut file = media_entry("file", "remote.txt", "content");
+        file.file_name = "报告.txt".into();
+        let target = local_media_target(&file, root).unwrap();
+        assert_eq!(
+            target.parent(),
+            Some(root.join("staged").join("webdav").as_path())
+        );
+    }
+
+    #[test]
+    fn failed_remote_index_read_never_overwrites_media_map() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::Duration;
+
+        for response in [
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot-json",
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let stop = stopped.clone();
+            let server = std::thread::spawn(move || {
+                let mut methods = Vec::new();
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .unwrap();
+                            let mut request = Vec::new();
+                            let mut byte = [0u8; 1];
+                            while !request.ends_with(b"\r\n\r\n") {
+                                if stream.read(&mut byte).unwrap() == 0 {
+                                    break;
+                                }
+                                request.push(byte[0]);
+                            }
+                            let method = String::from_utf8_lossy(&request)
+                                .split_whitespace()
+                                .next()
+                                .unwrap()
+                                .to_string();
+                            let reply = if method == "GET" {
+                                response
+                            } else {
+                                "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            };
+                            methods.push(method);
+                            stream.write_all(reply.as_bytes()).unwrap();
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("HTTP server failed: {e}"),
+                    }
+                }
+                methods
+            });
+            let config = super::WebDavConfig {
+                url: format!("http://{address}"),
+                username: String::new(),
+                password: String::new(),
+                remote_dir: String::new(),
+                proxy_mode: "none".into(),
+                proxy_url: String::new(),
+                accept_invalid_certs: false,
+            };
+            let result = super::upload_media_map(
+                &config,
+                &[media_entry("image", "local.png", "local")],
+                "dev-a",
+            );
+            stopped.store(true, Ordering::SeqCst);
+            let methods = server.join().unwrap();
+            assert!(result.is_err());
+            assert_eq!(
+                methods,
+                ["GET"],
+                "failed reads must not mutate remote state"
+            );
+        }
     }
 }

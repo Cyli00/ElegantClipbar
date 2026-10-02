@@ -84,20 +84,9 @@ pub async fn webdav_upload(
 
         let pending_media_workers = if options.sync_image || options.sync_files {
             let device_id = webdav::get_or_create_device_id(&db);
-            let local_map = build_local_media_map(&db, &data_dir, &options, &device_id);
-            if local_map.is_empty() {
-                let map = webdav::download_media_map(&config).unwrap_or_default();
-                let _ = webdav::cleanup_orphaned_remote_media(&config, &map);
-            } else {
-                match webdav::upload_media_map(&config, &local_map, &device_id) {
-                    Ok(map) => {
-                        let _ = webdav::cleanup_orphaned_remote_media(&config, &map);
-                    }
-                    Err(e) => {
-                        tracing::warn!("上传 media map 失败，跳过清理: {}", e);
-                    }
-                }
-            }
+            let local_map = build_local_media_map(&db, &data_dir, &options, &device_id)?;
+            let map = webdav::upload_media_map(&config, &local_map, &device_id)?;
+            let _ = webdav::cleanup_orphaned_remote_media(&config, &map);
             spawn_media_upload_files(&app, &config, &data_dir, &local_map)
         } else {
             0
@@ -193,10 +182,10 @@ fn build_local_media_map(
     data_dir: &std::path::Path,
     options: &SyncOptions,
     device_id: &str,
-) -> Vec<webdav::MediaEntry> {
-    let items = webdav::query_sync_items(db, options).unwrap_or_default();
+) -> Result<Vec<webdav::MediaEntry>, String> {
+    let items = webdav::query_sync_items(db, options)?;
     let (map, _) = webdav::build_media_map(&items, data_dir, options, device_id);
-    map
+    Ok(map)
 }
 
 struct MediaSyncComplete {

@@ -764,7 +764,46 @@ fn extract_html_from_clipboard_data(data: &str) -> Result<String> {
 	if end_idx < start_idx {
 		return Err("Invalid HTML offsets: end index before start index".into());
 	}
-	Ok(data[start_idx..end_idx].to_string())
+	data.get(start_idx..end_idx)
+		.map(str::to_owned)
+		.ok_or_else(|| "Invalid HTML offsets: offsets split a UTF-8 character".into())
+}
+
+#[cfg(test)]
+mod html_tests {
+	use super::{extract_html_from_clipboard_data, plain_html_to_cf_html};
+
+	#[test]
+	fn extracts_unicode_html_using_byte_offsets() {
+		let html = "<html><body>中文 café 😀</body></html>";
+		let data = plain_html_to_cf_html(html);
+		assert_eq!(extract_html_from_clipboard_data(&data).unwrap(), html);
+	}
+
+	#[test]
+	fn rejects_invalid_html_byte_offsets() {
+		let data = plain_html_to_cf_html("<html><body>中文😀</body></html>");
+		let html_start = data.find("<html>").unwrap();
+		let unicode_start = data.find('中').unwrap();
+		let original_start = format!("StartHTML:{html_start:010}");
+		let original_end = format!("EndHTML:{:010}", data.len());
+
+		for (start, end) in [
+			(unicode_start + 1, data.len()),
+			(html_start, unicode_start + 1),
+			(data.len() + 1, data.len()),
+			(html_start, data.len() + 1),
+			(data.len(), html_start),
+		] {
+			let malformed = data
+				.replace(&original_start, &format!("StartHTML:{start:010}"))
+				.replace(&original_end, &format!("EndHTML:{end:010}"));
+			assert!(
+				extract_html_from_clipboard_data(&malformed).is_err(),
+				"accepted invalid offsets {start}..{end}"
+			);
+		}
+	}
 }
 
 fn set_bitmap_inner(data: &[u8]) -> Result<()> {

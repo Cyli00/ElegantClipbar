@@ -5,7 +5,6 @@ import { create } from "zustand";
 import { cancelPendingFocusRestore } from "@/hooks/useInputFocus";
 import { logError } from "@/lib/logger";
 import { playCopySound, setupPasteSoundListeners } from "@/lib/sounds";
-import { mergeCaptureItem, matchesListFilter } from "@/stores/clipboard-merge";
 import { useUISettings } from "@/stores/ui-settings";
 
 function batchResetState() {
@@ -47,7 +46,7 @@ interface ClipboardState {
   isLoading: boolean;
   searchQuery: string;
   selectedGroup: string | null;
-  /** 当前选中的自定义分组 id（与 selectedGroup 互斥） */
+  /** 当前选中的自定义分组 id，可与类型或收藏筛选组合 */
   selectedGroupId: number | null;
   /** 当前键盘高亮索引（-1 表示无） */
   activeIndex: number;
@@ -78,8 +77,6 @@ interface ClipboardState {
   /** 清空当前分组历史，返回删除条数；失败返回 null */
   clearHistory: (contentType?: string | null) => Promise<number | null>;
   refresh: () => Promise<void>;
-  /** 剪贴板捕获后增量更新列表（单条 IPC） */
-  applyCaptureUpdate: (id: number) => Promise<void>;
   /** 重置视图：清除搜索、类型筛选，滚动到顶部，刷新 */
   resetView: () => Promise<void>;
   setupListener: () => Promise<() => void>;
@@ -150,17 +147,29 @@ export const useClipboardStore = create<ClipboardState>((set, get) => ({
   },
 
   setSearchQuery: (query: string) => {
-    set({ searchQuery: query });
+    set((state) => ({
+      searchQuery: query,
+      _fetchId: state._fetchId + 1,
+      isLoading: false,
+    }));
     // 仅更新查询状态，防抖在 App.tsx 中处理
   },
 
   setSelectedGroup: (group: string | null) => {
-    set({ selectedGroup: group, ...batchResetState() });
+    set((state) => ({
+      selectedGroup: group,
+      _fetchId: state._fetchId + 1,
+      ...batchResetState(),
+    }));
     get().fetchItems();
   },
 
   setSelectedGroupId: (groupId: number | null) => {
-    set({ selectedGroupId: groupId, ...batchResetState() });
+    set((state) => ({
+      selectedGroupId: groupId,
+      _fetchId: state._fetchId + 1,
+      ...batchResetState(),
+    }));
     invoke("set_active_group", { groupId }).catch((error) => {
       logError("Failed to persist active group:", error);
     });
@@ -264,31 +273,6 @@ export const useClipboardStore = create<ClipboardState>((set, get) => ({
     await get().fetchItems();
   },
 
-  applyCaptureUpdate: async (id: number) => {
-    const state = get();
-    if (state.searchQuery) {
-      await get().fetchItems();
-      return;
-    }
-
-    try {
-      const item = await invoke<ClipboardItem | null>("get_clipboard_item", { id });
-      if (!item) {
-        return;
-      }
-      if (!matchesListFilter(item, state.selectedGroup, state.selectedGroupId)) {
-        return;
-      }
-      set((s) => ({
-        items: mergeCaptureItem(s.items, item),
-        activeIndex: -1,
-      }));
-    } catch (error) {
-      logError("Failed to apply capture update:", error);
-      await get().fetchItems();
-    }
-  },
-
   resetView: async () => {
     // 仅重置搜索和类型筛选，保留分组选择
     set((state) => ({
@@ -296,18 +280,33 @@ export const useClipboardStore = create<ClipboardState>((set, get) => ({
       selectedGroup: null,
       ...batchResetState(),
       _resetToken: state._resetToken + 1,
+      _fetchId: state._fetchId + 1,
     }));
     await get().fetchItems({ search: "" });
   },
 
   setupListener: async () => {
     const unlistenPasteSound = await setupPasteSoundListeners();
+    let disposed = false;
+    let refreshing = false;
+    let refreshPending = false;
 
-    // 防抖合并快速连续的剪贴板变化事件，避免 IPC 风暴
-    const debouncedCaptureUpdate = debounce(async (id: number) => {
-      await get().applyCaptureUpdate(id);
-      playCopySound("after_success");
-    }, 50, { leading: false, trailing: true });
+    // 合并连续捕获并定期刷新权威轻量列表，同时同步后端淘汰的记录
+    const debouncedCaptureUpdate = debounce(async () => {
+      if (refreshing) {
+        refreshPending = true;
+        return;
+      }
+      refreshing = true;
+      refreshPending = false;
+      try {
+        await get().fetchItems();
+        if (!disposed) playCopySound("after_success");
+      } finally {
+        refreshing = false;
+        if (refreshPending && !disposed) void debouncedCaptureUpdate();
+      }
+    }, 50, { leading: false, trailing: true, maxWait: 250 });
 
     const unlisten = await listen<number>("clipboard-updated", (event) => {
       const id = event.payload;
@@ -315,9 +314,11 @@ export const useClipboardStore = create<ClipboardState>((set, get) => ({
         return;
       }
       playCopySound("immediate");
-      void debouncedCaptureUpdate(id);
+      void debouncedCaptureUpdate();
     });
     return () => {
+      disposed = true;
+      debouncedCaptureUpdate.cancel();
       unlistenPasteSound();
       unlisten();
     };

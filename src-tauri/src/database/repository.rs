@@ -904,51 +904,89 @@ impl ClipboardRepository {
             return Ok((0, vec![], vec![]));
         }
 
-        let conn = self.write_conn.lock();
+        let mut conn = self.write_conn.lock();
+        let tx = conn.transaction()?;
         let current_count = ConditionBuilder::new()
             .clearable()
             .group(group_id)
-            .count_items(&conn)?;
+            .count_items(&tx)?;
 
         if current_count <= max_count {
             return Ok((0, vec![], vec![]));
         }
         let to_delete = current_count - max_count;
 
-        let image_paths = ConditionBuilder::new()
-            .clearable()
-            .group(group_id)
-            .condition("image_path IS NOT NULL")
-            .param(to_delete)
-            .select_strings(
-                &conn,
-                "SELECT image_path FROM clipboard_items",
-                "ORDER BY created_at ASC LIMIT ?",
-            )?;
-
-        let file_payloads = ConditionBuilder::new()
-            .clearable()
-            .group(group_id)
-            .condition("file_payload IS NOT NULL")
-            .param(to_delete)
-            .select_strings(
-                &conn,
-                "SELECT file_payload FROM clipboard_items",
-                "ORDER BY created_at ASC LIMIT ?",
-            )?;
-
-        let del_cb = ConditionBuilder::new()
+        let candidates = ConditionBuilder::new()
             .clearable()
             .group(group_id)
             .param(to_delete);
         let delete_sql = format!(
             "DELETE FROM clipboard_items WHERE id IN (\
                 SELECT id FROM clipboard_items{} \
-                ORDER BY created_at ASC LIMIT ?\
-            )",
-            del_cb.where_clause()
+                ORDER BY created_at ASC, id ASC LIMIT ?\
+            ) RETURNING image_path, file_payload",
+            candidates.where_clause()
         );
-        let deleted = conn.execute(&delete_sql, del_cb.param_refs().as_slice())? as i64;
+        let mut image_paths = Vec::new();
+        let mut file_payloads = Vec::new();
+        let mut deleted = 0;
+        {
+            let mut stmt = tx.prepare(&delete_sql)?;
+            let rows = stmt.query_map(candidates.param_refs().as_slice(), |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })?;
+            for row in rows {
+                let (image_path, file_payload) = row?;
+                deleted += 1;
+                if let Some(path) = image_path {
+                    image_paths.push(path);
+                }
+                if let Some(payload) = file_payload {
+                    file_payloads.push(payload);
+                }
+            }
+        }
+
+        // Content-addressed assets can also belong to retained/protected items in other groups.
+        if !image_paths.is_empty() || !file_payloads.is_empty() {
+            use crate::clipboard::file_clipboard::{decode_payload, encode_payload};
+            let mut retained_paths = std::collections::HashSet::new();
+            let mut stmt = tx.prepare(
+                "SELECT image_path, file_payload FROM clipboard_items \
+                 WHERE image_path IS NOT NULL OR file_payload IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })?;
+            for row in rows {
+                let (image_path, file_payload) = row?;
+                if let Some(path) = image_path {
+                    retained_paths.insert(path);
+                }
+                if let Some(payload) = decode_payload(file_payload.as_deref()) {
+                    retained_paths.extend(payload.staged.into_iter().map(|file| file.staged));
+                }
+            }
+            image_paths.retain(|path| !retained_paths.contains(path));
+            for raw in &mut file_payloads {
+                if let Some(mut payload) = decode_payload(Some(raw)) {
+                    let original_count = payload.staged.len();
+                    payload
+                        .staged
+                        .retain(|file| !retained_paths.contains(&file.staged));
+                    if payload.staged.len() != original_count {
+                        *raw = encode_payload(&payload);
+                    }
+                }
+            }
+        }
+        tx.commit()?;
 
         debug!(
             "Enforced max count: deleted {} oldest items (group: {:?})",
@@ -2111,6 +2149,162 @@ mod tests {
         repo.insert(make_text_item("under_limit")).unwrap();
         let (deleted, _, _) = repo.enforce_max_count(10, None).unwrap();
         assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn enforce_max_count_keeps_newer_assets_when_evicting_text() {
+        for content_type in [ContentType::Image, ContentType::Files] {
+            let db = temp_db();
+            let repo = ClipboardRepository::new(&db);
+            let old_id = repo.insert(make_text_item("old text")).unwrap();
+            let mut asset = make_sized_sync_item(content_type, 10, "new asset");
+            if content_type == ContentType::Files {
+                asset.file_payload = Some(
+                    r#"{"staged":[{"original":"/original.txt","staged":"/staged.txt","size":10}]}"#
+                        .to_string(),
+                );
+            }
+            let new_id = repo.insert(asset.clone()).unwrap();
+            repo.write_conn
+                .lock()
+                .execute(
+                    "UPDATE clipboard_items SET created_at = CASE WHEN id = ?1 \
+                     THEN '2020-01-01 00:00:00' ELSE '2020-01-02 00:00:00' END",
+                    params![old_id],
+                )
+                .unwrap();
+
+            let (deleted, paths, payloads) = repo.enforce_max_count(1, None).unwrap();
+
+            assert_eq!(deleted, 1);
+            assert!(paths.is_empty());
+            assert!(payloads.is_empty());
+            assert!(repo.get_by_id(old_id).unwrap().is_none());
+            let retained = repo.get_by_id(new_id).unwrap().unwrap();
+            assert_eq!(retained.image_path, asset.image_path);
+            assert_eq!(retained.file_payload, asset.file_payload);
+        }
+    }
+
+    #[test]
+    fn enforce_max_count_returns_only_evicted_assets_with_timestamp_ties() {
+        let db = temp_db();
+        let repo = ClipboardRepository::new(&db);
+        let image = make_sized_sync_item(ContentType::Image, 10, "old image");
+        let image_id = repo.insert(image.clone()).unwrap();
+        let mut files = make_sized_sync_item(ContentType::Files, 10, "old files");
+        files.file_payload = Some(
+            r#"{"staged":[{"original":"/original.txt","staged":"/old.txt","size":10}]}"#
+                .to_string(),
+        );
+        let files_id = repo.insert(files.clone()).unwrap();
+        let retained_id = repo.insert(make_text_item("retained")).unwrap();
+        repo.write_conn
+            .lock()
+            .execute(
+                "UPDATE clipboard_items SET created_at = '2020-01-01 00:00:00'",
+                [],
+            )
+            .unwrap();
+
+        let (deleted, paths, payloads) = repo.enforce_max_count(1, None).unwrap();
+
+        assert_eq!(deleted, 2);
+        assert_eq!(paths, vec![image.image_path.unwrap()]);
+        assert_eq!(payloads, vec![files.file_payload.unwrap()]);
+        assert!(repo.get_by_id(image_id).unwrap().is_none());
+        assert!(repo.get_by_id(files_id).unwrap().is_none());
+        assert!(repo.get_by_id(retained_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn enforce_max_count_respects_groups_and_protected_items() {
+        let db = temp_db();
+        let repo = ClipboardRepository::new(&db);
+        let group_id = GroupRepository::new(&db)
+            .create("retention", None)
+            .unwrap()
+            .id;
+        let default_id = repo.insert(make_text_item("default")).unwrap();
+        let mut group_ids = Vec::new();
+        for text in ["pinned", "favorite", "old", "new"] {
+            let mut item = make_text_item(text);
+            item.group_id = Some(group_id);
+            group_ids.push(repo.insert(item).unwrap());
+        }
+        repo.toggle_pin(group_ids[0]).unwrap();
+        repo.toggle_favorite(group_ids[1]).unwrap();
+        repo.write_conn
+            .lock()
+            .execute(
+                "UPDATE clipboard_items SET created_at = '2020-01-01 00:00:00'",
+                [],
+            )
+            .unwrap();
+
+        let (deleted, paths, payloads) = repo.enforce_max_count(1, Some(group_id)).unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(paths.is_empty());
+        assert!(payloads.is_empty());
+        assert!(repo.get_by_id(group_ids[2]).unwrap().is_none());
+        for id in [default_id, group_ids[0], group_ids[1], group_ids[3]] {
+            assert!(repo.get_by_id(id).unwrap().is_some());
+        }
+        assert_eq!(repo.enforce_max_count(1, None).unwrap().0, 0);
+    }
+
+    #[test]
+    fn enforce_max_count_preserves_assets_referenced_by_other_groups() {
+        use crate::clipboard::file_clipboard::staged_paths_from_payload;
+
+        let db = temp_db();
+        let repo = ClipboardRepository::new(&db);
+        let group_id = GroupRepository::new(&db)
+            .create("shared assets", None)
+            .unwrap()
+            .id;
+        let image = make_sized_sync_item(ContentType::Image, 10, "shared image");
+        let image_id = repo.insert(image.clone()).unwrap();
+        let mut retained_image = image;
+        retained_image.group_id = Some(group_id);
+        let retained_image_id = repo.insert(retained_image).unwrap();
+        let mut files = make_sized_sync_item(ContentType::Files, 20, "shared files");
+        files.file_payload = Some(
+            r#"{"staged":[{"original":"/a.txt","staged":"/shared.txt","size":10},{"original":"/b.txt","staged":"/evicted.txt","size":10}]}"#
+                .to_string(),
+        );
+        let files_id = repo.insert(files.clone()).unwrap();
+        let mut retained_files = files;
+        retained_files.group_id = Some(group_id);
+        retained_files.file_payload = Some(
+            r#"{"staged":[{"original":"/a.txt","staged":"/shared.txt","size":10}]}"#.to_string(),
+        );
+        let retained_files_id = repo.insert(retained_files).unwrap();
+        let text_id = repo.insert(make_text_item("new text")).unwrap();
+        repo.write_conn
+            .lock()
+            .execute(
+                "UPDATE clipboard_items SET created_at = '2020-01-01 00:00:00'",
+                [],
+            )
+            .unwrap();
+
+        let (deleted, paths, payloads) = repo.enforce_max_count(1, None).unwrap();
+
+        assert_eq!(deleted, 2);
+        assert!(paths.is_empty());
+        let staged: Vec<_> = payloads
+            .iter()
+            .flat_map(|payload| staged_paths_from_payload(Some(payload)))
+            .collect();
+        assert_eq!(staged, vec!["/evicted.txt"]);
+        for id in [image_id, files_id] {
+            assert!(repo.get_by_id(id).unwrap().is_none());
+        }
+        for id in [retained_image_id, retained_files_id, text_id] {
+            assert!(repo.get_by_id(id).unwrap().is_some());
+        }
     }
 
     // ==================== SettingsRepository ====================

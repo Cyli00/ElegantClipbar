@@ -1,8 +1,41 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type EventCallback } from "@tauri-apps/api/event";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { useClipboardStore, type ClipboardItem } from "./clipboard";
+
+function listItem(id: number): ClipboardItem {
+  return {
+    id,
+    content_type: "text",
+    text_content: null,
+    html_content: null,
+    rtf_content: null,
+    image_path: null,
+    file_paths: null,
+    content_hash: `hash-${id}`,
+    preview: `preview-${id}`,
+    byte_size: 10,
+    image_width: null,
+    image_height: null,
+    is_pinned: false,
+    is_favorite: false,
+    favorite_order: 0,
+    sort_order: id,
+    created_at: "2026-01-01T00:00:00",
+    updated_at: "2026-01-01T00:00:00",
+    access_count: 0,
+    last_accessed_at: null,
+    char_count: null,
+    source_app_name: null,
+    source_app_icon: null,
+    group_id: null,
+  };
+}
 
 // Reset store before each test
 beforeEach(() => {
+  vi.mocked(invoke).mockReset().mockResolvedValue(undefined);
+  vi.mocked(listen).mockReset().mockResolvedValue(() => {});
   useClipboardStore.setState({
     items: [],
     isLoading: false,
@@ -19,20 +52,6 @@ beforeEach(() => {
 });
 
 describe("clipboard store", () => {
-  describe("initial state", () => {
-    it("has correct defaults", () => {
-      const state = useClipboardStore.getState();
-      expect(state.items).toEqual([]);
-      expect(state.isLoading).toBe(false);
-      expect(state.searchQuery).toBe("");
-      expect(state.selectedGroup).toBeNull();
-      expect(state.selectedGroupId).toBeNull();
-      expect(state.activeIndex).toBe(-1);
-      expect(state.batchMode).toBe(false);
-      expect(state.selectedIds.size).toBe(0);
-    });
-  });
-
   describe("setSearchQuery", () => {
     it("updates search query", () => {
       useClipboardStore.getState().setSearchQuery("test query");
@@ -280,6 +299,185 @@ describe("clipboard store", () => {
 
       // Should have the fast result (fetch2), not the stale one
       expect(useClipboardStore.getState().items).toEqual(fastItems);
+    });
+  });
+
+  describe("view request invalidation", () => {
+    it("discards the previous view response during the search debounce gap", async () => {
+      const visible = listItem(1);
+      useClipboardStore.setState({ items: [visible] });
+      let resolveOld!: (items: ClipboardItem[]) => void;
+      vi.mocked(invoke).mockImplementationOnce(() => new Promise<ClipboardItem[]>((resolve) => {
+        resolveOld = resolve;
+      }));
+      const pending = useClipboardStore.getState().fetchItems();
+
+      useClipboardStore.getState().setSearchQuery("new search");
+      resolveOld([listItem(2)]);
+      await pending;
+
+      expect(useClipboardStore.getState().items).toEqual([visible]);
+      expect(useClipboardStore.getState().isLoading).toBe(false);
+    });
+
+    it("does not let a stale failure clear a newer view's loading state", async () => {
+      let rejectOld!: (error: Error) => void;
+      let resolveNew!: (items: ClipboardItem[]) => void;
+      vi.mocked(invoke)
+        .mockImplementationOnce(() => new Promise<ClipboardItem[]>((_, reject) => {
+          rejectOld = reject;
+        }))
+        .mockImplementationOnce(() => new Promise<ClipboardItem[]>((resolve) => {
+          resolveNew = resolve;
+        }));
+      const oldRequest = useClipboardStore.getState().fetchItems();
+      useClipboardStore.getState().setSearchQuery("new search");
+      const newRequest = useClipboardStore.getState().fetchItems();
+      rejectOld(new Error("old view failed"));
+      await oldRequest;
+      expect(useClipboardStore.getState().isLoading).toBe(true);
+
+      resolveNew([listItem(3)]);
+      await newRequest;
+      expect(useClipboardStore.getState().items.map((item) => item.id)).toEqual([3]);
+      expect(useClipboardStore.getState().isLoading).toBe(false);
+    });
+  });
+
+  describe("capture refresh", () => {
+    let onCapture: EventCallback<number>;
+    let cleanup: (() => void) | undefined;
+
+    beforeEach(async () => {
+      vi.useFakeTimers();
+      vi.mocked(listen).mockImplementation(async (event, handler) => {
+        if (event === "clipboard-updated") {
+          onCapture = handler as EventCallback<number>;
+        }
+        return () => {};
+      });
+      cleanup = await useClipboardStore.getState().setupListener();
+    });
+
+    afterEach(() => {
+      cleanup?.();
+      vi.useRealTimers();
+    });
+
+    function capture(id: number) {
+      onCapture({ event: "clipboard-updated", id: 1, payload: id });
+    }
+
+    it("removes evicted records and keeps only lightweight list data after capture", async () => {
+      const retained = listItem(2);
+      const captured = listItem(3);
+      useClipboardStore.setState({ items: [listItem(1), retained] });
+      vi.mocked(invoke).mockImplementation(async (command) => {
+        if (command === "get_clipboard_item") {
+          return { ...captured, text_content: "full captured body", html_content: "<p>full body</p>" };
+        }
+        return [captured, retained];
+      });
+
+      capture(3);
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(useClipboardStore.getState().items).toEqual([captured, retained]);
+      expect(useClipboardStore.getState().items.every((item) =>
+        item.text_content === null && item.html_content === null && item.rtf_content === null
+      )).toBe(true);
+    });
+
+    it.each([
+      { selectedGroup: "image,files,url", contentType: "image,files,url", favoriteOnly: false },
+      { selectedGroup: "__favorites__", contentType: null, favoriteOnly: true },
+    ])("preserves the custom group and $selectedGroup intersection", async ({
+      selectedGroup, contentType, favoriteOnly,
+    }) => {
+      const visible = {
+        ...listItem(1), group_id: 42, content_type: "image" as const, is_favorite: true,
+      };
+      const excludedCapture = { ...listItem(2), group_id: 42 };
+      useClipboardStore.setState({ items: [visible], selectedGroupId: 42, selectedGroup });
+      vi.mocked(invoke).mockImplementation(async (command) =>
+        command === "get_clipboard_item" ? excludedCapture : [visible]
+      );
+
+      capture(2);
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(useClipboardStore.getState().items).toEqual([visible]);
+      expect(invoke).toHaveBeenCalledWith("get_clipboard_items", expect.objectContaining({
+        groupId: 42, contentType, favoriteOnly,
+      }));
+    });
+
+    it("discards a capture response after the selected group changes", async () => {
+      let resolveCapture!: (items: ClipboardItem[]) => void;
+      vi.mocked(invoke).mockImplementationOnce(() => new Promise<ClipboardItem[]>((resolve) => {
+        resolveCapture = resolve;
+      }));
+      capture(1);
+      await vi.advanceTimersByTimeAsync(50);
+      const currentView = { ...listItem(2), group_id: 42 };
+      vi.mocked(invoke)
+        .mockResolvedValueOnce(undefined)
+        .mockResolvedValueOnce([currentView]);
+      useClipboardStore.getState().setSelectedGroupId(42);
+      await vi.advanceTimersByTimeAsync(0);
+      resolveCapture([listItem(1)]);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(useClipboardStore.getState().items).toEqual([currentView]);
+    });
+
+    it("refreshes during continuous captures instead of waiting for silence", async () => {
+      const latest = listItem(99);
+      useClipboardStore.setState({ items: [listItem(1)] });
+      vi.mocked(invoke).mockResolvedValue([latest]);
+
+      for (let index = 0; index < 15; index++) {
+        capture(index + 2);
+        await vi.advanceTimersByTimeAsync(20);
+      }
+
+      expect(useClipboardStore.getState().items).toEqual([latest]);
+    });
+
+    it("publishes slow capture refreshes and then catches up with events received in flight", async () => {
+      let resolveFirst!: (items: ClipboardItem[]) => void;
+      const firstSnapshot = listItem(2);
+      const latestSnapshot = listItem(3);
+      useClipboardStore.setState({ items: [listItem(1)] });
+      vi.mocked(invoke)
+        .mockImplementationOnce(() => new Promise<ClipboardItem[]>((resolve) => {
+          resolveFirst = resolve;
+        }))
+        .mockResolvedValue([latestSnapshot]);
+      capture(2);
+      await vi.advanceTimersByTimeAsync(50);
+      for (let index = 0; index < 30; index++) {
+        capture(3);
+        await vi.advanceTimersByTimeAsync(20);
+      }
+      resolveFirst([firstSnapshot]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(useClipboardStore.getState().items).toEqual([firstSnapshot]);
+
+      await vi.advanceTimersByTimeAsync(50);
+      expect(useClipboardStore.getState().items).toEqual([latestSnapshot]);
+    });
+
+    it("cancels a pending capture refresh when the listener is removed", async () => {
+      const visible = listItem(1);
+      useClipboardStore.setState({ items: [visible] });
+      vi.mocked(invoke).mockResolvedValue([listItem(2)]);
+      capture(2);
+      cleanup?.();
+      cleanup = undefined;
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(useClipboardStore.getState().items).toEqual([visible]);
     });
   });
 });

@@ -12,7 +12,7 @@ export default defineConfig(async () => ({
   // Path alias
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "./src"),
+      "@": path.resolve(import.meta.dirname, "./src"),
     },
   },
 
@@ -22,8 +22,8 @@ export default defineConfig(async () => ({
     target: 'esnext',
     rolldownOptions: {
       input: {
-        main: path.resolve(__dirname, "index.html"),
-        settings: path.resolve(__dirname, "settings.html"),
+        main: path.resolve(import.meta.dirname, "index.html"),
+        settings: path.resolve(import.meta.dirname, "settings.html"),
       },
       output: {
         codeSplitting: {

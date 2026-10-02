@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// 日志文件大小上限：10 MB
 pub const DEFAULT_LOG_MAX_SIZE: u64 = 10 * 1024 * 1024;
@@ -17,6 +17,10 @@ pub struct AppConfig {
     /// 自定义数据目录（包含数据库和图片），为 None 时使用默认路径
     #[serde(default)]
     pub data_path: Option<String>,
+
+    /// 迁移请求：重启后补齐最终快照，成功打开目标库才切换 data_path。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_data_path: Option<String>,
 
     /// 是否将日志写入文件（默认 false）
     #[serde(default)]
@@ -65,7 +69,20 @@ impl AppConfig {
 
         let content = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
 
-        fs::write(&config_path, content).map_err(|e| e.to_string())?;
+        let temporary = config_path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| {
+            use std::io::Write;
+            let mut file = fs::File::create(&temporary).map_err(|e| e.to_string())?;
+            file.write_all(content.as_bytes())
+                .map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            drop(file);
+            fs::rename(&temporary, &config_path).map_err(|e| e.to_string())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result?;
 
         info!("Configuration saved to {:?}", config_path);
         Ok(())
@@ -120,111 +137,138 @@ fn get_config_path() -> PathBuf {
     crate::database::get_app_dir().join("config.json")
 }
 
-/// 将数据从旧路径迁移到新路径
-pub fn migrate_data(old_path: &PathBuf, new_path: &PathBuf) -> Result<MigrationResult, String> {
-    info!("Migrating data: {:?} -> {:?}", old_path, new_path);
-
-    // 确保新目录存在
-    fs::create_dir_all(new_path).map_err(|e| format!("创建新目录失败: {e}"))?;
-
-    let mut result = MigrationResult::default();
-
-    // 迁移数据库文件
-    let old_db = old_path.join("clipboard.db");
-    let new_db = new_path.join("clipboard.db");
-    if old_db.exists() {
-        // 复制数据库相关文件（db, db-wal, db-shm）
-        for ext in &["", "-wal", "-shm"] {
-            let old_file = old_path.join(format!("clipboard.db{ext}"));
-            let new_file = new_path.join(format!("clipboard.db{ext}"));
-            if old_file.exists() {
-                match fs::copy(&old_file, &new_file) {
-                    Ok(bytes) => {
-                        info!("Copied {:?} ({} bytes)", old_file, bytes);
-                        result.files_copied += 1;
-                        result.bytes_copied += bytes;
-                    }
-                    Err(e) => {
-                        error!("Failed to copy {:?}: {}", old_file, e);
-                        result
-                            .errors
-                            .push(format!("Failed to copy {old_file:?}: {e}"));
-                    }
-                }
-            }
+/// 复制锁定连接的一致快照；调用方负责暂存目录的发布和配置提交。
+pub(crate) fn migrate_data(
+    source: &rusqlite::Connection,
+    old_path: &Path,
+    staging: &Path,
+    destination: &Path,
+) -> Result<MigrationResult, String> {
+    fs::create_dir_all(staging).map_err(|e| e.to_string())?;
+    let db_path = staging.join("clipboard.db");
+    {
+        let mut target = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+        let backup = rusqlite::backup::Backup::new(source, &mut target)
+            .map_err(|e| format!("初始化迁移备份失败: {e}"))?;
+        backup
+            .run_to_completion(100, std::time::Duration::ZERO, None)
+            .map_err(|e| format!("备份数据库失败: {e}"))?;
+    }
+    let mut result = MigrationResult {
+        db_migrated: true,
+        files_copied: 1,
+        bytes_copied: fs::metadata(&db_path).map_err(|e| e.to_string())?.len(),
+        ..MigrationResult::default()
+    };
+    for name in ["images", "icons", "staged"] {
+        let source = old_path.join(name);
+        if source.try_exists().map_err(|e| e.to_string())? {
+            copy_dir_recursive(&source, &staging.join(name), &mut result)?;
         }
-        result.db_migrated = new_db.exists();
     }
-
-    // 迁移图片目录
-    let old_images = old_path.join("images");
-    let new_images = new_path.join("images");
-    if old_images.exists() && old_images.is_dir() {
-        fs::create_dir_all(&new_images).ok();
-        if let Ok(entries) = fs::read_dir(&old_images) {
-            for entry in entries.flatten() {
-                let file_name = entry.file_name();
-                let old_file = entry.path();
-                let new_file = new_images.join(&file_name);
-
-                if old_file.is_file() {
-                    match fs::copy(&old_file, &new_file) {
-                        Ok(bytes) => {
-                            result.files_copied += 1;
-                            result.bytes_copied += bytes;
-                        }
-                        Err(e) => {
-                            result
-                                .errors
-                                .push(format!("Failed to copy {file_name:?}: {e}"));
-                        }
-                    }
-                }
-            }
-        }
-        result.images_migrated = new_images.exists();
-    }
-
-    // 迁移 staging 目录（递归）
-    let old_staged = old_path.join("staged");
-    let new_staged = new_path.join("staged");
-    if old_staged.exists() && old_staged.is_dir() {
-        copy_dir_recursive(&old_staged, &new_staged, &mut result);
-    }
-
-    info!(
-        "Migration complete: {} files, {} bytes",
-        result.files_copied, result.bytes_copied
-    );
+    result.images_migrated = staging.join("images").is_dir();
+    let db = crate::database::Database::new(db_path).map_err(|e| e.to_string())?;
+    rebase_asset_paths(&db.write_connection().lock(), staging, destination)?;
     Ok(result)
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path, result: &mut MigrationResult) {
-    if fs::create_dir_all(dst).is_err() {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(src) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn copy_dir_recursive(src: &Path, dst: &Path, result: &mut MigrationResult) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| format!("创建 {dst:?} 失败: {e}"))?;
+    for entry in fs::read_dir(src).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
         let old_file = entry.path();
         let new_file = dst.join(entry.file_name());
-        if old_file.is_dir() {
-            copy_dir_recursive(&old_file, &new_file, result);
-        } else if old_file.is_file() {
-            match fs::copy(&old_file, &new_file) {
-                Ok(bytes) => {
-                    result.files_copied += 1;
-                    result.bytes_copied += bytes;
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        if kind.is_dir() {
+            copy_dir_recursive(&old_file, &new_file, result)?;
+        } else if kind.is_file() {
+            let bytes = fs::copy(&old_file, &new_file)
+                .map_err(|e| format!("复制 {old_file:?} 失败: {e}"))?;
+            result.files_copied += 1;
+            result.bytes_copied += bytes;
+        } else {
+            return Err(format!("不支持迁移符号链接: {old_file:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// 数据库存储绝对路径；只重定位备份中实际存在的托管资产，保留原始文件路径。
+pub(crate) fn rebase_asset_paths(
+    conn: &rusqlite::Connection,
+    staging: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    use crate::clipboard::file_clipboard::{decode_payload, encode_payload};
+    let relocate = |value: &str, directory: &str| {
+        let normalized = value.replace('\\', "/");
+        let prefix = format!("{directory}/");
+        let marker = format!("/{directory}/");
+        let relative = normalized
+            .rsplit_once(marker.as_str())
+            .map(|(_, relative)| relative)
+            .or_else(|| normalized.strip_prefix(prefix.as_str()))?;
+        let relative = Path::new(relative);
+        if relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return None;
+        }
+        let relative = Path::new(directory).join(relative);
+        staging
+            .join(&relative)
+            .is_file()
+            .then(|| destination.join(relative).to_string_lossy().into_owned())
+    };
+    let transaction = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    {
+        let mut select = transaction
+            .prepare("SELECT id, image_path, source_app_icon, file_payload FROM clipboard_items")
+            .map_err(|e| e.to_string())?;
+        let rows = select
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut update = transaction.prepare(
+            "UPDATE clipboard_items SET image_path = ?2, source_app_icon = ?3, file_payload = ?4 WHERE id = ?1",
+        ).map_err(|e| e.to_string())?;
+        for row in rows {
+            let (id, image, icon, payload) = row.map_err(|e| e.to_string())?;
+            let new_image = image.as_deref().and_then(|v| relocate(v, "images"));
+            let new_icon = icon.as_deref().and_then(|v| relocate(v, "icons"));
+            let mut new_payload = None;
+            if let Some(mut parsed) = decode_payload(payload.as_deref()) {
+                let mut changed = false;
+                for file in &mut parsed.staged {
+                    if let Some(path) = relocate(&file.staged, "staged") {
+                        file.staged = path;
+                        changed = true;
+                    }
                 }
-                Err(e) => {
-                    result
-                        .errors
-                        .push(format!("Failed to copy {:?}: {e}", entry.file_name()));
+                if changed {
+                    new_payload = Some(encode_payload(&parsed));
                 }
+            }
+            if new_image.is_some() || new_icon.is_some() || new_payload.is_some() {
+                update
+                    .execute(rusqlite::params![
+                        id,
+                        new_image.or(image),
+                        new_icon.or(icon),
+                        new_payload.or(payload),
+                    ])
+                    .map_err(|e| e.to_string())?;
             }
         }
     }
+    transaction.commit().map_err(|e| e.to_string())
 }
 
 /// 数据迁移结果
@@ -235,10 +279,4 @@ pub struct MigrationResult {
     pub files_copied: usize,
     pub bytes_copied: u64,
     pub errors: Vec<String>,
-}
-
-impl MigrationResult {
-    pub fn success(&self) -> bool {
-        self.errors.is_empty() && self.db_migrated
-    }
 }

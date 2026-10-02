@@ -119,7 +119,9 @@ impl ClipboardMonitor {
                     worker_handler,
                     worker_clip_settings,
                     worker_running,
-                    worker_app,
+                    |id| {
+                        let _ = worker_app.emit("clipboard-updated", id);
+                    },
                 );
             })
         {
@@ -181,28 +183,20 @@ impl ClipboardMonitor {
         *self.thread_handle.lock() = Some(handle);
     }
 
-    /// 处理 worker 主循环：串行处理剪贴板内容，快速合并连续事件
+    /// 处理 worker 主循环：按捕获顺序处理，内容去重由 handler 的策略决定。
     fn run_capture_worker(
         rx: mpsc::Receiver<CaptureWorkItem>,
         handler: Arc<RwLock<Option<Arc<ClipboardHandler>>>>,
         clip_change_settings: Arc<RwLock<ClipChangeSettings>>,
         running: Arc<AtomicBool>,
-        app_handle: AppHandle,
+        mut emit_update: impl FnMut(i64),
     ) {
         info!("Clipboard worker thread started");
 
         while running.load(Ordering::SeqCst) {
-            let Ok(mut item) = rx.recv() else {
+            let Ok(item) = rx.recv() else {
                 break;
             };
-
-            // 防抖：等待 30ms 让快速连续事件（如 Firefox/Zen 多次 SetClipboardData）合并
-            std::thread::sleep(std::time::Duration::from_millis(30));
-
-            while let Ok(newer) = rx.try_recv() {
-                cleanup_capture_content(&item.content);
-                item = newer;
-            }
 
             if !clip_change_settings
                 .read()
@@ -219,7 +213,7 @@ impl ClipboardMonitor {
                 continue;
             };
 
-            // catch_unwind 防止单条异常数据的 panic 杀死整个进程（panic=abort）
+            // unwind 构建下隔离单条处理异常；release 的 panic=abort 不会执行此恢复路径。
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 h.process(item.content, item.source, item.group_id)
             }));
@@ -227,7 +221,7 @@ impl ClipboardMonitor {
             match result {
                 Ok(Ok(Some(id))) => {
                     debug!("Processed clipboard item: {}", id);
-                    let _ = app_handle.emit("clipboard-updated", id);
+                    emit_update(id);
                 }
                 Ok(Ok(None)) => {
                     debug!("Clipboard content already exists");
@@ -303,116 +297,121 @@ struct MonitorHandler {
     clip_change_settings: Arc<RwLock<ClipChangeSettings>>,
 }
 
-impl CRHandler for MonitorHandler {
-    fn on_clipboard_change(&mut self) {
-        if !self.running.load(Ordering::SeqCst) {
-            return;
+impl MonitorHandler {
+    fn is_active(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+            && self.pause_count.load(Ordering::SeqCst) == 0
+            && !self.user_paused.load(Ordering::SeqCst)
+    }
+
+    fn capture_with_retry(
+        &self,
+        mut sequence_number: impl FnMut() -> u32,
+        mut read_source: impl FnMut() -> Option<SourceAppInfo>,
+        mut read_content: impl FnMut(usize) -> Option<ClipboardContent>,
+        mut wait: impl FnMut(u64),
+    ) -> Option<CaptureWorkItem> {
+        const RETRY_DELAYS_MS: [u64; 7] = [0, 40, 80, 140, 220, 360, 560];
+
+        for (attempt, &delay) in RETRY_DELAYS_MS.iter().enumerate() {
+            if delay > 0 {
+                wait(delay);
+            }
+            if !self.is_active() {
+                debug!("Clipboard change ignored (stopped or paused)");
+                return None;
+            }
+
+            // 来源查询与所有格式读取必须属于同一个剪贴板序列。
+            let seq_before = sequence_number();
+            let source = read_source();
+            let max_image_bytes = {
+                let settings = self.clip_change_settings.read();
+                if settings.is_source_app_excluded(&source) {
+                    if sequence_number() != seq_before {
+                        continue;
+                    }
+                    debug!("Clipboard change ignored (source app excluded)");
+                    return None;
+                }
+                settings.max_image_bytes
+            };
+            if !self.is_active() {
+                return None;
+            }
+
+            let content = read_content(max_image_bytes);
+            if !self.is_active() {
+                return None;
+            }
+            if sequence_number() != seq_before {
+                debug!(
+                    "Clipboard changed during capture (attempt {}/{}), retrying",
+                    attempt + 1,
+                    RETRY_DELAYS_MS.len()
+                );
+                continue;
+            }
+
+            if let Some(content) = content {
+                return Some(CaptureWorkItem {
+                    content,
+                    source,
+                    group_id: *self.active_group_id.lock(),
+                });
+            }
+            debug!("Clipboard read returned nothing, will retry");
         }
 
-        if self.pause_count.load(Ordering::SeqCst) > 0 || self.user_paused.load(Ordering::SeqCst) {
-            debug!("Clipboard change ignored (paused)");
+        warn!(
+            "Clipboard capture failed after {} attempts",
+            RETRY_DELAYS_MS.len()
+        );
+        None
+    }
+
+    fn enqueue_capture(&self, item: CaptureWorkItem) {
+        // 暂停或过滤规则可能在读取大图片/等待重试期间发生变化。
+        if !self.is_active()
+            || self
+                .clip_change_settings
+                .read()
+                .is_source_app_excluded(&item.source)
+        {
             return;
         }
-
-        let source = super::source_app::get_clipboard_source_app();
-
-        let settings = self.clip_change_settings.read().clone();
-        if settings.is_source_app_excluded(&source) {
-            debug!(
-                "Clipboard change ignored (source app excluded: {:?})",
-                source.as_ref().map(|s| &s.app_name)
-            );
-            return;
-        }
-        let max_image_bytes = settings.max_image_bytes;
-        let capture_dir = self.capture_dir.read().clone();
-
-        let Some(content) = read_clipboard_content_with_retry(max_image_bytes, &capture_dir) else {
-            return;
-        };
-
-        let group_id = *self.active_group_id.lock();
-
-        let item = CaptureWorkItem {
-            content,
-            source,
-            group_id,
-        };
         if self.work_tx.send(item).is_err() {
             warn!("Clipboard worker channel closed, dropping event");
         }
     }
 }
 
-fn read_clipboard_content_with_retry(
-    max_image_bytes: usize,
-    capture_dir: &std::path::Path,
-) -> Option<ClipboardContent> {
-    const RETRY_DELAYS_MS: [u64; 7] = [0, 40, 80, 140, 220, 360, 560];
-
-    for (attempt, &delay) in RETRY_DELAYS_MS.iter().enumerate() {
-        if delay > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(delay));
-            debug!(
-                "Clipboard read retry {}/{}",
-                attempt + 1,
-                RETRY_DELAYS_MS.len()
-            );
+impl CRHandler for MonitorHandler {
+    fn on_clipboard_change(&mut self) {
+        if !self.is_active() {
+            return;
         }
-
-        match read_clipboard_content(max_image_bytes, capture_dir) {
-            Some(content) => return Some(content),
-            None if attempt + 1 < RETRY_DELAYS_MS.len() => {
-                if let Ok(ctx) = ClipboardContext::new()
-                    && file_clipboard::clipboard_has_pending_files(&ctx)
-                {
-                    debug!("Clipboard file data pending, will retry");
-                }
-                debug!("Clipboard read returned nothing, will retry");
-                continue;
-            }
-            None => {
-                warn!(
-                    "Clipboard read failed after {} attempts",
-                    RETRY_DELAYS_MS.len()
-                );
-                return None;
-            }
+        let capture_dir = self.capture_dir.read().clone();
+        if let Some(item) = self.capture_with_retry(
+            clipboard_sequence_number,
+            super::source_app::get_clipboard_source_app,
+            |max_image_bytes| read_clipboard_content_inner(max_image_bytes, &capture_dir),
+            |delay| std::thread::sleep(std::time::Duration::from_millis(delay)),
+        ) {
+            self.enqueue_capture(item);
         }
     }
-    None
 }
 
-fn read_clipboard_content(
-    max_image_bytes: usize,
-    capture_dir: &std::path::Path,
-) -> Option<ClipboardContent> {
-    const MAX_RETRIES: u32 = 2;
-
-    for attempt in 0..=MAX_RETRIES {
-        #[cfg(target_os = "windows")]
-        let seq_before =
-            unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
-
-        let result = read_clipboard_content_inner(max_image_bytes, capture_dir);
-
-        #[cfg(target_os = "windows")]
-        {
-            let seq_after =
-                unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
-            if seq_before != seq_after && attempt < MAX_RETRIES {
-                debug!(
-                    "Clipboard changed during read (attempt {}/{}), retrying",
-                    attempt + 1,
-                    MAX_RETRIES + 1
-                );
-                continue;
-            }
-        }
-
-        return result;
+fn clipboard_sequence_number() -> u32 {
+    #[cfg(target_os = "windows")]
+    {
+        unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() }
     }
-    None
+    #[cfg(not(target_os = "windows"))]
+    {
+        0
+    }
 }
 
 fn read_clipboard_content_inner(
@@ -486,6 +485,9 @@ fn read_clipboard_content_inner(
         return Some(content);
     }
 
+    if file_clipboard::clipboard_has_pending_files(&ctx) {
+        debug!("Clipboard file data pending, will retry");
+    }
     debug!("No recognizable content in clipboard");
     None
 }
@@ -586,7 +588,288 @@ fn read_rtf_from_context(ctx: &ClipboardContext) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_image_only_html;
+    use super::*;
+    use crate::database::SettingsRepository;
+    use std::cell::Cell;
+
+    fn with_test_database(test: impl FnOnce(&Database, &std::path::Path)) {
+        static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "ec_capture_test_{}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        {
+            let db = Database::new(root.join("clipboard.db")).unwrap();
+            test(&db, &root);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn test_monitor() -> (MonitorHandler, mpsc::Receiver<CaptureWorkItem>) {
+        let (work_tx, rx) = mpsc::channel();
+        (
+            MonitorHandler {
+                running: Arc::new(AtomicBool::new(true)),
+                pause_count: Arc::new(AtomicU32::new(0)),
+                user_paused: Arc::new(AtomicBool::new(false)),
+                active_group_id: Arc::new(Mutex::new(None)),
+                work_tx,
+                capture_dir: Arc::new(RwLock::new(PathBuf::new())),
+                clip_change_settings: Arc::new(RwLock::new(ClipChangeSettings::default())),
+            },
+            rx,
+        )
+    }
+
+    fn source(name: &str) -> Option<SourceAppInfo> {
+        Some(SourceAppInfo {
+            app_name: name.into(),
+            exe_path: format!("{name}.exe"),
+            icon_cache_key: name.into(),
+        })
+    }
+
+    fn queued_history(strategy: &str, captures: &[&str]) -> Vec<String> {
+        let mut history = Vec::new();
+        with_test_database(|db, root| {
+            SettingsRepository::new(db)
+                .set("dedup_strategy", strategy)
+                .unwrap();
+            let handler = Arc::new(ClipboardHandler::new(db, root.join("images")));
+            let (tx, rx) = mpsc::channel();
+            for text in captures {
+                assert!(
+                    tx.send(CaptureWorkItem {
+                        content: ClipboardContent::Text((*text).into()),
+                        source: None,
+                        group_id: None,
+                    })
+                    .is_ok()
+                );
+            }
+            drop(tx);
+            ClipboardMonitor::run_capture_worker(
+                rx,
+                Arc::new(RwLock::new(Some(handler))),
+                Arc::new(RwLock::new(ClipChangeSettings::default())),
+                Arc::new(AtomicBool::new(true)),
+                |_| {},
+            );
+            let conn = db.read_connection();
+            let conn = conn.lock();
+            history = conn
+                .prepare("SELECT text_content FROM clipboard_items ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+        });
+        history
+    }
+
+    #[test]
+    fn queued_captures_preserve_fifo_and_handler_deduplication() {
+        assert_eq!(
+            queued_history("move_to_top", &["first", "first", "second", "third"]),
+            ["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn queued_captures_preserve_repeated_copies_with_always_new() {
+        assert_eq!(
+            queued_history("always_new", &["first", "first", "second"]),
+            ["first", "first", "second"]
+        );
+    }
+
+    #[test]
+    fn retry_binds_source_and_content_to_the_same_sequence() {
+        let (monitor, _) = test_monitor();
+        let sequence = Cell::new(1);
+        let item = monitor
+            .capture_with_retry(
+                || sequence.get(),
+                || {
+                    source(if sequence.get() == 1 {
+                        "first"
+                    } else {
+                        "second"
+                    })
+                },
+                |_| {
+                    if sequence.replace(2) == 1 {
+                        Some(ClipboardContent::Text("mixed snapshot".into()))
+                    } else {
+                        Some(ClipboardContent::Text("second snapshot".into()))
+                    }
+                },
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(item.source.unwrap().app_name, "second");
+        assert!(matches!(
+            &item.content,
+            ClipboardContent::Text(text) if text == "second snapshot"
+        ));
+    }
+
+    #[test]
+    fn retry_rechecks_source_exclusion_after_clipboard_changes() {
+        with_test_database(|db, root| {
+            let settings = SettingsRepository::new(db);
+            settings.set("app_filter_enabled", "true").unwrap();
+            settings.set("app_filter_list", "private").unwrap();
+            let handler = ClipboardHandler::new(db, root.join("images"));
+            for changes_during_read in [false, true] {
+                let (monitor, _) = test_monitor();
+                *monitor.clip_change_settings.write() = handler.get_clip_change_settings();
+                let sequence = Cell::new(1);
+                let reads = Cell::new(0);
+                let item = monitor.capture_with_retry(
+                    || sequence.get(),
+                    || {
+                        source(if sequence.get() == 1 {
+                            "public"
+                        } else {
+                            "private"
+                        })
+                    },
+                    |_| {
+                        reads.set(reads.get() + 1);
+                        if changes_during_read {
+                            sequence.set(2);
+                            Some(ClipboardContent::Text("private content".into()))
+                        } else {
+                            None
+                        }
+                    },
+                    |_| sequence.set(2),
+                );
+                assert!(item.is_none());
+                assert_eq!(reads.get(), 1, "excluded content must not be read again");
+            }
+        });
+    }
+
+    #[test]
+    fn unstable_final_attempt_is_discarded_and_capture_file_is_removed() {
+        with_test_database(|_, root| {
+            let (monitor, _) = test_monitor();
+            let sequence = Cell::new(0);
+            let temp_path = root.join("unstable.tmp");
+            let item = monitor.capture_with_retry(
+                || sequence.get(),
+                || None,
+                |_| {
+                    sequence.set(sequence.get() + 1);
+                    std::fs::write(&temp_path, b"captured image").unwrap();
+                    Some(ClipboardContent::ImageFile(ImageCapture {
+                        temp_path: temp_path.clone(),
+                        ..ImageCapture::default()
+                    }))
+                },
+                |_| {},
+            );
+            assert!(item.is_none());
+            assert_eq!(
+                sequence.get(),
+                7,
+                "unstable captures must have a retry limit"
+            );
+            assert!(!temp_path.exists());
+        });
+    }
+
+    #[test]
+    fn pause_during_retry_delay_prevents_another_content_read() {
+        for user_pause in [false, true] {
+            let (monitor, _) = test_monitor();
+            let reads = Cell::new(0);
+            let item = monitor.capture_with_retry(
+                || 1,
+                || None,
+                |_| {
+                    reads.set(reads.get() + 1);
+                    None
+                },
+                |_| {
+                    if user_pause {
+                        monitor.user_paused.store(true, Ordering::SeqCst);
+                    } else {
+                        monitor.pause_count.store(1, Ordering::SeqCst);
+                    }
+                },
+            );
+            assert!(item.is_none());
+            assert_eq!(reads.get(), 1);
+        }
+    }
+
+    #[test]
+    fn pause_during_capture_discards_the_snapshot() {
+        let (monitor, _) = test_monitor();
+        let item = monitor.capture_with_retry(
+            || 1,
+            || None,
+            |_| {
+                monitor.pause_count.store(1, Ordering::SeqCst);
+                Some(ClipboardContent::Text("internal clipboard write".into()))
+            },
+            |_| {},
+        );
+        assert!(item.is_none());
+    }
+
+    #[test]
+    fn enqueue_rechecks_pause_and_running_state() {
+        for state in 0..3 {
+            let (monitor, rx) = test_monitor();
+            let item = monitor
+                .capture_with_retry(
+                    || 1,
+                    || None,
+                    |_| Some(ClipboardContent::Text("captured".into())),
+                    |_| {},
+                )
+                .unwrap();
+            match state {
+                0 => monitor.pause_count.store(1, Ordering::SeqCst),
+                1 => monitor.user_paused.store(true, Ordering::SeqCst),
+                _ => monitor.running.store(false, Ordering::SeqCst),
+            }
+            monitor.enqueue_capture(item);
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+    }
+
+    #[test]
+    fn enqueue_rechecks_changed_source_filter() {
+        with_test_database(|db, root| {
+            let (monitor, rx) = test_monitor();
+            let item = monitor
+                .capture_with_retry(
+                    || 1,
+                    || source("private"),
+                    |_| Some(ClipboardContent::Text("private content".into())),
+                    |_| {},
+                )
+                .unwrap();
+            let settings = SettingsRepository::new(db);
+            settings.set("app_filter_enabled", "true").unwrap();
+            settings.set("app_filter_list", "private").unwrap();
+            *monitor.clip_change_settings.write() =
+                ClipboardHandler::new(db, root.join("images")).get_clip_change_settings();
+            monitor.enqueue_capture(item);
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        });
+    }
 
     #[test]
     fn single_image_fragment() {

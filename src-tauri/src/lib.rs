@@ -22,7 +22,6 @@ mod win_v_registry;
 use clipboard::ClipboardMonitor;
 use commands::AppState;
 use config::AppConfig;
-use database::Database;
 use database::SettingsRepository;
 use shortcut::parse_shortcut;
 use std::collections::{HashMap, HashSet};
@@ -804,15 +803,11 @@ pub fn run() {
         .setup(move |app| {
             main_thread::init();
 
-            let db_path = config.get_db_path();
-            let images_path = config.get_images_path();
-
-            commands::data_transfer::apply_pending_import(&db_path);
-
-            let db = Database::new(db_path).map_err(|e| {
+            let mut config = config;
+            let db = commands::data_transfer::open_database(&mut config).inspect_err(|e| {
                 tracing::error!("Database initialization failed: {}", e);
-                e.to_string()
             })?;
+            let images_path = config.get_images_path();
 
             let monitor = ClipboardMonitor::new();
             monitor.init(&db, images_path);

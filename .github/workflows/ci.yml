@@ -24,10 +24,13 @@ jobs:
         run: npm ci
 
       - name: ESLint
-        run: npm run lint
+        run: npm run lint -- --max-warnings=0
 
       - name: TypeScript check
         run: npx tsc --noEmit
+
+      - name: Production build
+        run: npm run build
 
       - name: Unit tests
         run: npm run test
@@ -60,6 +63,10 @@ jobs:
       - name: Cargo test
         working-directory: src-tauri
         run: cargo test
+
+      - name: Clipboard HTML parser regressions
+        working-directory: src-tauri
+        run: cargo test -p clipboard-rs --lib html_tests
 
   # ── E2E smoke tests (Playwright via Vite dev server) ──
   e2e:
