@@ -1,8 +1,13 @@
 # ElegantClipboard 更新日志
 
-## 未发布
+## v1.2.8
+**状态：** 待发布
 
 - fix: 修复 Shift+Insert 粘贴未标记独立 Insert 扩展键而导致 Shift 状态丢失；检查 SendInput 返回值，并在注入失败时释放本次补按的修饰键 https://github.com/Y-ASLant/ElegantClipboard/issues/149
+- fix: 浏览器复制单张图片时按图片记录，保留带文字内容的富文本优先策略 https://github.com/Y-ASLant/ElegantClipboard/issues/163
+- fix: 应用内更新使用标准 UAC 提权启动安装器，取消授权或启动失败时保留当前会话 https://github.com/Y-ASLant/ElegantClipboard/issues/156
+- fix: Scoop 更新保留用户数据目录 https://github.com/Y-ASLant/ElegantClipboard/issues/153
+- fix: WebDAV 纯文本同步不再上传图片、文件和应用图标
 - fix: 历史数量清理从实际删除记录收集图片与暂存文件，保留其它分组或受保护条目仍引用的资源
 - fix: 数据导入先完整解包并验证 SQLite，再提交数据库与资产；打开失败或安装中断时恢复原数据，导出包含嵌套暂存文件
 - fix: 数据目录迁移使用 SQLite Backup API，重启时补齐最终快照后才切换配置，并重定位托管资产路径
