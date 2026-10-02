@@ -1,220 +1,62 @@
-# ElegantClipboard
+# ElegantClipbar
 
 English | [中文](README.md)
 
-## Versions and Branches
+A macOS menu bar clipboard app. Its layout and window behavior follow ClashBar: a native panel, 360 pt wide, anchored below the menu bar icon, with the system light or dark appearance.
 
-- **`main` branch**: The existing **1.x version**, built with Tauri + React.
-- **[`gpui` branch](https://github.com/Y-ASLant/ElegantClipboard/tree/gpui)**: A **complete 2.0.0 rewrite built with Rust + GPUI**, developed separately from the existing Tauri version.
+Built with Swift, SwiftUI, and a small amount of AppKit. Data stays on your Mac. Supports macOS 13 or later on Apple Silicon and Intel, with **0 remote Swift package dependencies**.
 
-The features, screenshots, and build instructions below apply to the `main` branch. For the 2.0.0 implementation and build instructions, see the documentation on the [`gpui` branch](https://github.com/Y-ASLant/ElegantClipboard/tree/gpui).
+## Everyday use
 
-> Note: UI screenshots in this document may be outdated and were captured on **v0.5.0**.
+- Press **⌥⌘V (Option + Command + V)** or click the menu bar icon to open clipboard history.
+- Search, preview, and pin frequently used items. Supports text, links, HTML/RTF rich text, images, and files.
+- Click an item or press Return to close the panel, return to the previous app, and paste. Automatic paste requires permission in **System Settings → Privacy & Security → Accessibility**. Without permission, the item is still copied to the system clipboard so you can press ⌘V yourself.
+- File history stores paths only. If an original file is moved or deleted, the item is marked unavailable.
+- Items with identical content and formats are deduplicated and moved to the top. Identical text with different formatting remains separate.
 
-<p align="center">
-  <img src="src-tauri/icons/icon.png" alt="ElegantClipboard" width="128" height="128">
-</p>
-<p align="center">
-  Low footprint · High performance · Modern · Privacy first clipboard.
-</p>
+Ordinary history defaults to **1,000 items and 30 days**. An item is removed when either limit applies; both limits are configurable. Pinned items are exempt from automatic cleanup.
 
+Settings include launch at login, source app information, app exclusions, local backup import/export, and separate sounds for recording and pasting. Both sounds are off by default and can be previewed.
 
-<p align="center">
-  <a href="https://github.com/Y-ASLant/ElegantClipboard/releases"><img src="https://img.shields.io/github/v/release/Y-ASLant/ElegantClipboard?label=version&color=blue" alt="version"></a>
-  <a href="https://github.com/Y-ASLant/ElegantClipboard/releases"><img src="https://img.shields.io/github/downloads/Y-ASLant/ElegantClipboard/total?label=downloads&color=brightgreen" alt="downloads"></a>
-  <img src="https://img.shields.io/badge/platform-Windows-lightgrey.svg" alt="platform">
-  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="license">
-  <a href="https://github.com/Y-ASLant/ElegantClipboard/actions/workflows/ci.yml"><img src="https://github.com/Y-ASLant/ElegantClipboard/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-</p>
+The Swift version starts with empty history and supports backups in its new native format only. Translation, WebDAV sync, custom themes, groups, separate favorites, and toolbar customization are outside this native version's scope. The repository now contains the native project; the previous implementation remains available in Git history.
 
-## UI Screenshots (v0.5.0)
+## Build and run
 
-### Themes
+Requires macOS and an Xcode toolchain with Swift 6.0 or later. The resulting app runs on macOS 13 or later.
 
-#### System Accent Color
-
-![System Theme](img/theme_0.png)
-
-| Classic B&W | Jade Green | Sky Cyan |
-|:-:|:-:|:-:|
-| ![Classic](img/theme_1.png) | ![Jade](img/theme_2.png) | ![Sky](img/theme_3.png) |
-
-#### Dark Mode
-
-Automatically follows system dark/light mode, real-time switching
-
-### Settings
-
-| Data Management | Display | Shortcuts |
-|:-:|:-:|:-:|
-| ![Data](img/setting_1.png) | ![Display](img/setting_2.png) | ![Shortcuts](img/setting_3.png) |
-
-### Hover Image Preview
-
-![Preview](img/preview_mode.png)
-
-### Hover Text Preview
-
-Hover text preview shares the same preview position and hover preview delay settings (default 500ms; text preview is disabled by default).
-
-### Startup Notification
-
-![Notification](img/startup_notification.png)
-
-## Design Philosophy
-
-**Low footprint · High performance · Modern · Privacy first**
-
-- **Low footprint** - Tray resident, non-intrusive to core workflow, window doesn't steal focus, monitoring only when visible
-- **High performance** - Optimized LIKE search (CJK text support), virtual list for 10k+ records, async image processing, content hash deduplication
-- **Modern** - Tauri 2.0 + React 19 + Tailwind CSS 4, type-safe, elegant architecture
-- **Privacy first** - Data stored locally by default, optional WebDAV self-hosted sync, privacy in user's hands
-- **Multilingual UI** - Simplified Chinese / English / Traditional Chinese, switch in settings, synced across windows
-
-## Features
-
-See [FEATURES_EN.md](FEATURES_EN.md) for complete feature list and terminology.
-
-## Shortcuts
-
-### Global Shortcuts
-
-| Shortcut | Action |
-|----------|--------|
-| `Alt+C` | Show/hide window (default, customizable) |
-| `Win+V` | Show/hide window (optional, requires enable in settings) |
-
-### In-Window Shortcuts
-
-| Shortcut | Action |
-|----------|--------|
-| `↑` / `↓` | Navigate up/down |
-| `←` / `→` | Switch tab (All / Text / Other) |
-| `Enter` | Paste selected item |
-| `Shift+Enter` | Paste as plain text |
-| `Delete` | Delete selected item |
-| `ESC` | Close dialog / hide window |
-| `Ctrl+Scroll` | Zoom image preview / scroll text preview |
-
-## Tech Stack
-
-| Category | Technology |
-|----------|------------|
-| **Framework** | Tauri 2.0 |
-| **Frontend** | React 19 + TypeScript |
-| **Build** | Vite 7 |
-| **Styling** | Tailwind CSS 4 |
-| **Components** | shadcn/ui (Radix UI) + Fluent UI Icons |
-| **State** | Zustand 5 (persistence + multi-window sync) |
-| **Virtual List** | react-virtuoso |
-| **Drag & Drop** | @dnd-kit |
-| **Backend** | Rust |
-| **Database** | SQLite (rusqlite) + optimized LIKE (CJK support) |
-| **Hash** | BLAKE3 (content deduplication) |
-| **Locking** | parking_lot (high-performance Mutex/RwLock) |
-| **Parallel** | rayon (parallel file checking) |
-| **Clipboard** | clipboard-rs (text / HTML / RTF / image / files / watcher) |
-| **Window Effects** | window-vibrancy (Mica/Acrylic/Tabbed) |
-| **Keyboard Simulation** | enigo |
-| **Input Monitoring** | Win32 LL Hook (WH_MOUSE_LL + WH_KEYBOARD_LL, only when window visible) |
-| **Auto Update** | GitHub Release based check & download (system proxy supported) |
-| **CI/CD** | GitHub Actions (CI + Tag triggers Release) |
-
-## Installation
-
-### Download Installer
-
-Download the latest version from [Releases](https://github.com/Y-ASLant/ElegantClipboard/releases):
-
-- **Installer** (recommended): `ElegantClipboard_x.x.x_x64-setup.exe`
-- **Portable**: `ElegantClipboard_x.x.x_x64_portable.exe` (no installation required)
-
-### winget
-
-```powershell
-winget install Y-ASLant.ElegantClipboard
+```sh
+make check       # Compile the native app
+make test        # Run Swift tests
+make build       # Package a release app for this Mac
+make universal   # Package Apple Silicon + Intel
+make run         # Package and open a debug app
 ```
 
-### Scoop
+Tests use Swift Testing: `make test` runs `swift test --disable-xctest --enable-swift-testing`, which also works with Xcode Command Line Tools.
 
-```powershell
-scoop bucket add elegantclipboard https://github.com/Y-ASLant/ElegantClipboard
-scoop install elegantclipboard
+Build outputs:
+
+| Command | Output |
+| --- | --- |
+| `make build` / `make run` | `build/ElegantClipbar.app` |
+| `make universal` | `build/universal/ElegantClipbar.app` |
+
+The packaging script applies an ad-hoc signature for local use. Distribution to other Macs still requires developer signing and notarization. On repeated builds, the previous `.app` is moved to a system temporary directory, and its recovery path is printed.
+
+The default version is `0.1.0`; override it when packaging:
+
+```sh
+APP_VERSION=0.1.0 BUILD_NUMBER=1 ./scripts/package-app.sh --universal
 ```
 
-### Build from Source
+GitHub Actions CI compiles, tests, and packages both architectures. Pushing a `v*` tag matching the version in `Resources/Info.plist` (for example, `v0.1.0`) triggers `Build macOS release`: tests, universal packaging, signature verification, and a GitHub Release with the app ZIP and SHA-256 checksum. The workflow can also be manually run against an existing version tag.
 
-#### Requirements
+## Source layout
 
-- Node.js 18+ (LTS recommended)
-- Rust 1.96+ (Rust edition 2024)
-- Windows 10/11
-
-#### Build Steps
-
-```bash
-# Clone repository
-git clone https://github.com/Y-ASLant/ElegantClipboard.git
-cd ElegantClipboard
-
-# Install dependencies
-npm install
-
-# Build frontend only (dist/)
-npm run build
-
-# Development mode
-npm run tauri dev
-
-# Build production (current machine architecture)
-npm run tauri build
-
-# Build x64 / arm64 separately (run twice)
-npm run tauri build -- --target x86_64-pc-windows-msvc
-npm run tauri build -- --target aarch64-pc-windows-msvc
-
-# Code check
-npm run lint
-
-# Unit/component/perf tests
-make test
-# or: npx vitest run
-```
-
-Notes:
-- `npm run build` only runs `tsc && vite build` for frontend assets, no installer generated.
-- Installers are generated by `npm run tauri build`; without `--target` it only builds for current architecture.
-- To publish both x64 and arm64, run the target-specific build commands twice (or use CI with separate builds).
-
-#### Version Management
-
-```powershell
-# Update version in three places (package.json, tauri.conf.json, Cargo.toml)
-.\scripts\bump-version.ps1 0.5.0
-```
-
-Or push a tag, Release workflow will auto-sync version:
-
-```bash
-git tag v0.5.0
-git push origin v0.5.0
-```
-
-## Data Storage
-
-Data is stored in the **application installation directory**:
-
-| Type | Path |
-|---|---|
-| Config | `<install dir>\config.json` |
-| Database | `<install dir>\clipboard.db` |
-| Image Cache | `<install dir>\images\` |
-| Log | `<install dir>\app.log` |
-
-You can change the default data path in Settings → General → Data storage location. Data migration is supported.
-
-The installer version writes to the install directory and requires admin privileges. The portable version (no `uninstall.exe` beside the exe) can read and write in the exe directory normally.
-
-## License
+- `Sources/ElegantClipbar/`: Swift app, SwiftUI views, and system integration.
+- `Sources/CSQLite/`: Module declaration for macOS system SQLite.
+- `Tests/ElegantClipbarTests/`: Native data and behavior tests.
+- `Resources/Info.plist`: App identity and minimum macOS version.
+- `scripts/package-app.sh`: Compile, assemble, and sign the `.app`.
 
 [MIT License](LICENSE)

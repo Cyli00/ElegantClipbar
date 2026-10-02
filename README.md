@@ -1,220 +1,62 @@
-# ElegantClipboard
+# ElegantClipbar
 
 [English](README_EN.md) | 中文
 
-## 版本与分支
+用于 macOS 的菜单栏剪贴板工具。界面和窗口交互参照 ClashBar：360 pt 宽的原生面板固定在菜单栏图标下方，外观跟随系统明暗模式。
 
-- **`main` 分支**：现有 **1.x 版本**，采用 Tauri + React 架构。
-- **[`gpui` 分支](https://github.com/Y-ASLant/ElegantClipboard/tree/gpui)**：基于 **Rust + GPUI 的全新 2.0.0 重构版本**，与现有 Tauri 版本独立开发。
+应用使用 Swift、SwiftUI 和少量 AppKit，数据保存在本机。支持 macOS 13 及以上、Apple Silicon 和 Intel；Swift 包远程依赖为 **0**。
 
-本文下方的功能、截图和构建说明针对 `main` 分支。了解 2.0.0 的实现与构建方式，请前往 [`gpui` 分支](https://github.com/Y-ASLant/ElegantClipboard/tree/gpui)查看对应文档。
+## 日常使用
 
-> 说明：本文档中的界面截图可能与最新版本略有差异，当前截图拍摄于 **v0.5.0**。
+- 按 **⌥⌘V（Option + Command + V）**，或点击菜单栏图标，打开剪贴板历史。
+- 搜索、预览和置顶常用内容。支持文本、链接、HTML/RTF 富文本、图片及文件。
+- 点击记录或按回车，关闭面板并返回原应用粘贴。自动粘贴需要在「系统设置 → 隐私与安全性 → 辅助功能」中授权；未授权时仍会复制到系统剪贴板，可自行按 ⌘V。
+- 文件只保存路径。原文件移动或删除后，记录会提示文件不可用。
+- 内容及格式完全相同的记录会去重并移到最新位置；文字相同、格式不同的记录分别保留。
 
-<p align="center">
-  <img src="src-tauri/icons/icon.png" alt="ElegantClipboard" width="128" height="128">
-</p>
-<p align="center">
-  低占用 · 高性能 · 现代化 · 完全本地化离线剪贴板。
-</p>
+普通历史默认最多保留 **1,000 条、30 天**，超过任一限制就清理；可在设置中调整。置顶记录不参与自动清理。
 
+设置包括开机启动、来源应用识别、排除指定应用、本地备份导入导出，以及「记录成功」和「执行粘贴」两个独立音效开关。两个音效默认关闭，支持试听。
 
-<p align="center">
-  <a href="https://github.com/Y-ASLant/ElegantClipboard/releases"><img src="https://img.shields.io/github/v/release/Y-ASLant/ElegantClipboard?label=version&color=blue" alt="version"></a>
-  <a href="https://github.com/Y-ASLant/ElegantClipboard/releases"><img src="https://img.shields.io/github/downloads/Y-ASLant/ElegantClipboard/total?label=downloads&color=brightgreen" alt="downloads"></a>
-  <img src="https://img.shields.io/badge/platform-Windows-lightgrey.svg" alt="platform">
-  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="license">
-  <a href="https://github.com/Y-ASLant/ElegantClipboard/actions/workflows/ci.yml"><img src="https://github.com/Y-ASLant/ElegantClipboard/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-</p>
+Swift 版从空历史开始，备份仅适用于新的原生数据格式。翻译、WebDAV 同步、自定义主题、分组、独立收藏和工具栏定制不在本次原生版本范围内。仓库已迁移为原生工程，旧版实现可从 Git 历史查阅。
 
-## 界面截图（v0.5.0）
+## 构建与运行
 
-### 外观主题
+需要 macOS 和 Swift 6.0 或更新版本的 Xcode 工具链。应用最低运行版本为 macOS 13。
 
-#### 跟随系统强调色
-
-![跟随系统](img/theme_0.png)
-
-| 经典黑白 | 翡翠绿 | 天空青 |
-|:-:|:-:|:-:|
-| ![经典黑白](img/theme_1.png) | ![翡翠绿](img/theme_2.png) | ![天空青](img/theme_3.png) |
-
-#### 暗色模式
-
-自动跟随系统深色/浅色模式，实时切换
-
-### 设置界面
-
-| 数据管理 | 显示设置 | 快捷按键 |
-|:-:|:-:|:-:|
-| ![数据管理](img/setting_1.png) | ![显示设置](img/setting_2.png) | ![快捷按键](img/setting_3.png) |
-
-### 图片悬浮预览
-
-![图片预览](img/preview_mode.png)
-
-### 文本悬浮预览
-
-文本悬浮预览与图片悬浮预览共用预览位置与悬浮预览延时设置（默认 500ms，文本预览默认关闭）。
-
-### 启动通知
-
-![启动通知](img/startup_notification.png)
-
-## 设计理念
-
-**低占用 · 高性能 · 现代化 · 隐私优先**
-
-- **低占用** - 托盘常驻，不打扰核心工作流，窗口不抢占焦点，仅可见时启用监控
-- **高性能** - 优化的 LIKE 搜索（兼容 CJK 文本）、虚拟列表处理万级记录、异步图像处理、内容哈希去重
-- **现代化** - Tauri 2.0 + React 19 + Tailwind CSS 4，类型安全，优雅架构
-- **隐私优先** - 数据默认完全本地存储，可选 WebDAV 自建同步，隐私由用户掌控
-- **多语言界面** - 简体中文 / English / 繁體中文，设置中切换，多窗口实时同步
-
-## 功能特性
-
-完整功能列表与术语约定见 [FEATURES.md](FEATURES.md)。
-
-## 快捷键
-
-### 全局快捷键
-
-| 快捷键 | 功能 |
-|--------|------|
-| `Alt+C` | 显示/隐藏窗口（默认，可自定义） |
-| `Win+V` | 显示/隐藏窗口（可选，需在设置中开启） |
-
-### 窗口内快捷键
-
-| 快捷键 | 功能 |
-|--------|------|
-| `↑` / `↓` | 上下选择剪贴板条目 |
-| `←` / `→` | 切换分组标签（全部 / 文本 / 其它） |
-| `Enter` | 粘贴选中条目 |
-| `Shift+Enter` | 以纯文本粘贴选中条目 |
-| `Delete` | 删除选中条目 |
-| `ESC` | 关闭对话框/隐藏窗口 |
-| `Ctrl+滚轮` | 缩放图片预览 / 滚动文本预览 |
-
-## 技术栈
-
-| 类别 | 技术 |
-|------|------|
-| **框架** | Tauri 2.0 |
-| **前端** | React 19 + TypeScript |
-| **构建** | Vite 7 |
-| **样式** | Tailwind CSS 4 |
-| **组件** | shadcn/ui (Radix UI) + Fluent UI Icons |
-| **状态管理** | Zustand 5（持久化 + 多窗口同步） |
-| **虚拟列表** | react-virtuoso |
-| **拖拽排序** | @dnd-kit |
-| **后端** | Rust |
-| **数据库** | SQLite (rusqlite) + 优化的 LIKE 查询（支持 CJK 文本） |
-| **哈希** | BLAKE3（内容去重） |
-| **锁** | parking_lot（高性能 Mutex/RwLock） |
-| **并行** | rayon（文件检查并行化） |
-| **剪贴板** | clipboard-rs（文本 / HTML / RTF / 图片 / 文件 / 监听） |
-| **窗口特效** | window-vibrancy（Mica/Acrylic/Tabbed） |
-| **键盘模拟** | enigo |
-| **输入监控** | Win32 LL Hook（WH_MOUSE_LL + WH_KEYBOARD_LL，仅窗口可见时启用键盘钩子） |
-| **自动更新** | 基于 GitHub Release 的检查与下载（支持系统代理） |
-| **CI/CD** | GitHub Actions（CI + Tag 触发 Release） |
-
-## 安装
-
-### 下载安装包
-
-从 [Releases](https://github.com/Y-ASLant/ElegantClipboard/releases) 页面下载最新版本：
-
-- **安装版**（推荐）：`ElegantClipboard_x.x.x_x64-setup.exe`
-- **便携版**：`ElegantClipboard_x.x.x_x64_portable.exe`（无需安装，直接运行）
-
-### winget
-
-```powershell
-winget install Y-ASLant.ElegantClipboard
+```sh
+make check       # 编译检查
+make test        # 运行 Swift 测试
+make build       # 为当前 Mac 构建 release 应用
+make universal   # 构建 Apple Silicon + Intel 通用应用
+make run         # 构建并打开 debug 应用
 ```
 
-### Scoop
+测试使用 Swift Testing：`make test` 执行 `swift test --disable-xctest --enable-swift-testing`，可直接使用 Xcode Command Line Tools 运行。
 
-```powershell
-scoop bucket add elegantclipboard https://github.com/Y-ASLant/ElegantClipboard
-scoop install elegantclipboard
+构建产物：
+
+| 命令 | 输出 |
+| --- | --- |
+| `make build` / `make run` | `build/ElegantClipbar.app` |
+| `make universal` | `build/universal/ElegantClipbar.app` |
+
+构建脚本使用临时签名（ad-hoc），适合本地运行。分发给其他 Mac 前还需要开发者签名和公证。重复打包会把旧 `.app` 移到系统临时目录，并输出可恢复的路径。
+
+版本号默认 `0.1.0`，可在打包时设置：
+
+```sh
+APP_VERSION=0.1.0 BUILD_NUMBER=1 ./scripts/package-app.sh --universal
 ```
 
-### 从源码构建
+GitHub Actions 的 CI 执行编译、测试和双架构打包。推送与 `Resources/Info.plist` 版本一致的 `v*` 标签（例如 `v0.1.0`）会自动运行 `Build macOS release`：测试、双架构打包、验证签名，再创建 GitHub Release，附上通用 `.app` 的 ZIP 和 SHA-256 校验文件。也可对已有版本标签手动运行工作流。
 
-#### 环境要求
+## 项目结构
 
-- Node.js 18+（推荐 LTS 版本）
-- Rust 1.96+（Rust edition 2024）
-- Windows 10/11
-
-#### 构建步骤
-
-```bash
-# 克隆仓库
-git clone https://github.com/Y-ASLant/ElegantClipboard.git
-cd ElegantClipboard
-
-# 安装依赖
-npm install
-
-# 仅构建前端静态资源（dist/）
-npm run build
-
-# 开发模式
-npm run tauri dev
-
-# 构建生产版本（默认仅当前机器架构）
-npm run tauri build
-
-# 分别构建 x64 / arm64 安装包（需执行两次）
-npm run tauri build -- --target x86_64-pc-windows-msvc
-npm run tauri build -- --target aarch64-pc-windows-msvc
-
-# 代码检查
-npm run lint
-
-# 单元/组件/性能测试
-make test
-# 或：npx vitest run
-```
-
-说明：
-- `npm run build` 只会执行 `tsc && vite build`，用于前端资源构建，不会生成安装包。
-- 安装包由 `npm run tauri build` 生成；不指定 `--target` 时只构建当前环境对应架构。
-- 需要同时发布 `x64` 和 `arm64` 时，需分别执行两次带 `--target` 的构建命令（或在 CI 中分架构构建）。
-
-#### 版本管理
-
-```powershell
-# 统一修改三处版本号（package.json, tauri.conf.json, Cargo.toml）
-.\scripts\bump-version.ps1 0.5.0
-```
-
-或直接推送 tag，Release workflow 自动同步版本号并构建：
-
-```bash
-git tag v0.5.0
-git push origin v0.5.0
-```
-
-## 数据存储
-
-数据存储在**可执行文件所在目录**：
-
-| 类型 | 路径 |
-|---|---|
-| 配置文件 | `<安装目录>\config.json` |
-| 数据库 | `<安装目录>\clipboard.db` |
-| 图片缓存 | `<安装目录>\images\` |
-| 日志 | `<安装目录>\app.log` |
-
-可在设置 → 常规 → 数据存储位置修改默认路径，支持数据迁移。
-
-安装版默认使用安装目录，需管理员权限写入；便携版（无 `uninstall.exe`）在 exe 同级目录可正常读写。
-
-## 许可证
+- `Sources/ElegantClipbar/`：Swift 应用、SwiftUI 界面及系统交互。
+- `Sources/CSQLite/`：macOS 自带 SQLite 的模块声明。
+- `Tests/ElegantClipbarTests/`：原生数据与行为测试。
+- `Resources/Info.plist`：应用身份和 macOS 最低版本。
+- `scripts/package-app.sh`：编译、组装并签名 `.app`。
 
 [MIT License](LICENSE)
