@@ -115,45 +115,89 @@ fn build_context_snippet(
 mod win_keyboard {
     use tracing::info;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, INPUT, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
-        SendInput,
+        GetAsyncKeyState, INPUT, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, SendInput, VK_INSERT, VK_LWIN, VK_RWIN,
     };
 
     pub fn is_key_pressed(vk: u16) -> bool {
         unsafe { GetAsyncKeyState(i32::from(vk)) < 0 }
     }
 
-    pub fn send_key(vk: u16, up: bool) {
-        let input = INPUT {
+    fn keyboard_input(vk: u16, up: bool) -> INPUT {
+        let mut flags = if up {
+            KEYEVENTF_KEYUP
+        } else {
+            KEYBD_EVENT_FLAGS(0)
+        };
+        // 明确发送独立 Insert，而不是数字小键盘 Insert/0；Win 键也使用 E0 标记。
+        if vk == VK_INSERT.0 || vk == VK_LWIN.0 || vk == VK_RWIN.0 {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(vk),
                     wScan: 0,
-                    dwFlags: if up {
-                        KEYEVENTF_KEYUP
-                    } else {
-                        KEYBD_EVENT_FLAGS(0)
-                    },
+                    dwFlags: flags,
                     time: 0,
                     dwExtraInfo: 0,
                 },
             },
-        };
-        unsafe {
-            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
         }
     }
 
+    pub fn send_key(vk: u16, up: bool) -> Result<(), String> {
+        let input = keyboard_input(vk, up);
+        let inserted = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+        if inserted != 1 {
+            return Err(format!(
+                "SendInput failed for key {vk:#x}: inserted {inserted}/1 events"
+            ));
+        }
+        Ok(())
+    }
+
     /// 若用户正按住修饰键则释放，最多重试 20 次（间隔 5ms）。
-    pub fn release_if_held(vk: u16) {
+    pub fn release_if_held(vk: u16) -> Result<(), String> {
         for _ in 0..20 {
             if !is_key_pressed(vk) {
-                return;
+                return Ok(());
             }
-            send_key(vk, true);
+            send_key(vk, true)?;
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        if is_key_pressed(vk) {
+            return Err(format!("Modifier key {vk:#x} is still pressed"));
+        }
+        Ok(())
+    }
+
+    pub fn send_combo(modifier: u16, key: u16) -> Result<(), String> {
+        send_combo_with(modifier, key, is_key_pressed(modifier), send_key)
+    }
+
+    fn send_combo_with(
+        modifier: u16,
+        key: u16,
+        user_held_modifier: bool,
+        mut send: impl FnMut(u16, bool) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if !user_held_modifier {
+            send(modifier, false)?;
+        }
+        let result = (|| {
+            send(key, false)?;
+            std::thread::sleep(std::time::Duration::from_millis(8));
+            send(key, true)
+        })();
+        // 主键注入失败时也释放本次补按的修饰键；不释放用户原本按住的键。
+        let release = if !user_held_modifier {
+            send(modifier, true)
+        } else {
+            Ok(())
+        };
+        result.and(release)
     }
 
     pub fn log_foreground_window(action: &str) {
@@ -164,36 +208,92 @@ mod win_keyboard {
         let title = String::from_utf16_lossy(&buf[..len]);
         info!("{action}: foreground hwnd={:?} title=\"{title}\"", fg.0);
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_INSERT, VK_SHIFT, VK_V};
+
+        #[test]
+        fn insert_is_extended_on_both_edges_without_changing_modifier_encoding() {
+            for up in [false, true] {
+                let insert = unsafe { keyboard_input(VK_INSERT.0, up).Anonymous.ki };
+                assert_eq!(insert.wVk, VK_INSERT);
+                assert!(insert.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+                assert_eq!(insert.dwFlags.contains(KEYEVENTF_KEYUP), up);
+                for key in [VK_SHIFT, VK_CONTROL, VK_V] {
+                    let event = unsafe { keyboard_input(key.0, up).Anonymous.ki };
+                    assert!(!event.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+                    assert_eq!(event.dwFlags.contains(KEYEVENTF_KEYUP), up);
+                }
+            }
+        }
+
+        #[test]
+        fn failed_main_key_injection_releases_only_the_injected_modifier() {
+            for user_held in [false, true] {
+                for failed_up in [false, true] {
+                    let mut modifier_down = user_held;
+                    let result = send_combo_with(VK_SHIFT.0, VK_INSERT.0, user_held, |key, up| {
+                        if key == VK_INSERT.0 && up == failed_up {
+                            return Err("injection rejected".into());
+                        }
+                        if key == VK_SHIFT.0 {
+                            modifier_down = !up;
+                        }
+                        Ok(())
+                    });
+                    assert_eq!(result, Err("injection rejected".into()));
+                    assert_eq!(modifier_down, user_held);
+                }
+            }
+        }
+
+        #[test]
+        fn failed_modifier_press_does_not_send_the_main_key() {
+            let mut main_key_sent = false;
+            let result = send_combo_with(VK_SHIFT.0, VK_INSERT.0, false, |key, _| {
+                if key == VK_SHIFT.0 {
+                    return Err("modifier rejected".into());
+                }
+                main_key_sent = true;
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert!(!main_key_sent);
+        }
+
+        #[test]
+        fn modifier_release_failure_is_reported() {
+            let result = send_combo_with(VK_SHIFT.0, VK_INSERT.0, false, |key, up| {
+                if key == VK_SHIFT.0 && up {
+                    Err("release rejected".into())
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result, Err("release rejected".into()));
+        }
+    }
 }
 
 /// 使用 Windows SendInput API 模拟 Ctrl+组合键。
 /// 先释放用户可能按住的所有修饰键（Alt/Shift/Win），再发送纯净的组合键。
 #[cfg(target_os = "windows")]
 fn simulate_ctrl_combo(key_vk: u16, action: &str) -> Result<(), String> {
-    use win_keyboard::{is_key_pressed, log_foreground_window, release_if_held, send_key};
+    use win_keyboard::{log_foreground_window, release_if_held, send_combo};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
     };
 
     log_foreground_window(action);
 
-    release_if_held(VK_MENU.0);
-    release_if_held(VK_SHIFT.0);
-    release_if_held(VK_LWIN.0);
-    release_if_held(VK_RWIN.0);
+    release_if_held(VK_MENU.0)?;
+    release_if_held(VK_SHIFT.0)?;
+    release_if_held(VK_LWIN.0)?;
+    release_if_held(VK_RWIN.0)?;
 
-    let user_ctrl = is_key_pressed(VK_CONTROL.0);
-    if !user_ctrl {
-        send_key(VK_CONTROL.0, false);
-    }
-    send_key(key_vk, false);
-    std::thread::sleep(std::time::Duration::from_millis(8));
-    send_key(key_vk, true);
-    if !user_ctrl {
-        send_key(VK_CONTROL.0, true);
-    }
-
-    Ok(())
+    send_combo(VK_CONTROL.0, key_vk)
 }
 
 pub const PASTE_KEY_SETTING: &str = "paste_key";
@@ -222,30 +322,19 @@ pub fn simulate_paste() -> Result<(), String> {
 /// 先释放 Ctrl/Alt/Win，保留或补按 Shift 后发送 Insert。
 #[cfg(target_os = "windows")]
 fn simulate_shift_insert() -> Result<(), String> {
-    use win_keyboard::{is_key_pressed, log_foreground_window, release_if_held, send_key};
+    use win_keyboard::{log_foreground_window, release_if_held, send_combo};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         VK_CONTROL, VK_INSERT, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
     };
 
     log_foreground_window("simulate_shift_insert");
 
-    release_if_held(VK_MENU.0);
-    release_if_held(VK_CONTROL.0);
-    release_if_held(VK_LWIN.0);
-    release_if_held(VK_RWIN.0);
+    release_if_held(VK_MENU.0)?;
+    release_if_held(VK_CONTROL.0)?;
+    release_if_held(VK_LWIN.0)?;
+    release_if_held(VK_RWIN.0)?;
 
-    let user_shift = is_key_pressed(VK_SHIFT.0);
-    if !user_shift {
-        send_key(VK_SHIFT.0, false);
-    }
-    send_key(VK_INSERT.0, false);
-    std::thread::sleep(std::time::Duration::from_millis(8));
-    send_key(VK_INSERT.0, true);
-    if !user_shift {
-        send_key(VK_SHIFT.0, true);
-    }
-
-    Ok(())
+    send_combo(VK_SHIFT.0, VK_INSERT.0)
 }
 
 /// 使用 Windows SendInput API 模拟 Ctrl+C 复制选中文字。

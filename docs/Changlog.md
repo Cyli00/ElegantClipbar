@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- fix: 修复 Shift+Insert 粘贴未标记独立 Insert 扩展键而导致 Shift 状态丢失；检查 SendInput 返回值，并在注入失败时释放本次补按的修饰键 https://github.com/Y-ASLant/ElegantClipboard/issues/149
 - fix: 历史数量清理从实际删除记录收集图片与暂存文件，保留其它分组或受保护条目仍引用的资源
 - fix: 数据导入先完整解包并验证 SQLite，再提交数据库与资产；打开失败或安装中断时恢复原数据，导出包含嵌套暂存文件
 - fix: 数据目录迁移使用 SQLite Backup API，重启时补齐最终快照后才切换配置，并重定位托管资产路径
