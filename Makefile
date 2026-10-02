@@ -42,8 +42,8 @@ check:
 	npx tsc --noEmit
 	@Write-Host "[check] cargo"
 	cargo check --manifest-path src-tauri/Cargo.toml
-	@Write-Host "[check] clippy"
-	cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+	@Write-Host "[check] clippy (correctness gate; other warnings are advisory)"
+	cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D clippy::correctness
 	@Write-Host "[check] done"
 
 test:

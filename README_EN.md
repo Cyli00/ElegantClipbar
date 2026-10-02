@@ -2,6 +2,13 @@
 
 English | [中文](README.md)
 
+## Versions and Branches
+
+- **`main` branch**: The existing **1.x version**, built with Tauri + React.
+- **[`gpui` branch](https://github.com/Y-ASLant/ElegantClipboard/tree/gpui)**: A **complete 2.0.0 rewrite built with Rust + GPUI**, developed separately from the existing Tauri version.
+
+The features, screenshots, and build instructions below apply to the `main` branch. For the 2.0.0 implementation and build instructions, see the documentation on the [`gpui` branch](https://github.com/Y-ASLant/ElegantClipboard/tree/gpui).
+
 > Note: UI screenshots in this document may be outdated and were captured on **v0.5.0**.
 
 <p align="center">

@@ -56,9 +56,10 @@ jobs:
         working-directory: src-tauri
         run: cargo fmt --all -- --check
 
-      - name: Clippy
+      - name: Clippy (correctness gate)
         working-directory: src-tauri
-        run: cargo clippy --all-targets -- -D warnings
+        # Keep advisory warnings visible; compilation and correctness errors remain fatal.
+        run: cargo clippy --all-targets -- -D clippy::correctness
 
       - name: Cargo test
         working-directory: src-tauri

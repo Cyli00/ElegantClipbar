@@ -2,6 +2,13 @@
 
 [English](README_EN.md) | 中文
 
+## 版本与分支
+
+- **`main` 分支**：现有 **1.x 版本**，采用 Tauri + React 架构。
+- **[`gpui` 分支](https://github.com/Y-ASLant/ElegantClipboard/tree/gpui)**：基于 **Rust + GPUI 的全新 2.0.0 重构版本**，与现有 Tauri 版本独立开发。
+
+本文下方的功能、截图和构建说明针对 `main` 分支。了解 2.0.0 的实现与构建方式，请前往 [`gpui` 分支](https://github.com/Y-ASLant/ElegantClipboard/tree/gpui)查看对应文档。
+
 > 说明：本文档中的界面截图可能与最新版本略有差异，当前截图拍摄于 **v0.5.0**。
 
 <p align="center">

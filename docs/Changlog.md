@@ -20,6 +20,7 @@
 - chore: 更新现有兼容范围内的前后端依赖（React 19.3、Tauri 2.12.1、Radix UI、Tailwind CSS 4.3.3、Playwright 1.63）；保留 TypeScript 6、Vitest 4、jsdom 29 与本地 clipboard-rs 分叉
 - chore: 配套 Tauri 2.12 同步 Windows/windows-core 0.62 与 webview2-com 0.39，避免不同 COM 绑定版本造成类型不兼容；上游依赖更新移除 unic-* 停止维护告警
 - fix: 自定义 NSIS 模板适配新版 Tauri 的 Restart Manager 进程检查，加载所需宏并传入安装目录下可执行文件的完整路径，修复安装包生成失败
+- ci: Clippy 与本地 `make check` 改为仅将正确性 lint 作为错误门禁，保留普通警告输出；编译错误、格式检查和测试失败仍阻断验收
 
 ## v1.2.7
 **发布日期：** 2026年8月9日
