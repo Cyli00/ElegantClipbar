@@ -1,119 +1,36 @@
-name: CI
+name: macOS CI
 
 on:
   push:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  # ── Frontend: lint + typecheck + unit tests ──
-  frontend:
-    name: Frontend
-    runs-on: windows-latest
+  native:
+    name: Swift tests and universal app
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-          cache: npm
+      - name: Toolchain
+        run: swift --version
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Compile
+        run: make check
 
-      - name: ESLint
-        run: npm run lint -- --max-warnings=0
+      - name: Swift Testing
+        run: make test
 
-      - name: TypeScript check
-        run: npx tsc --noEmit
+      - name: Build Apple Silicon and Intel app
+        run: make universal
 
-      - name: Production build
-        run: npm run build
-
-      - name: Unit tests
-        run: npm run test
-
-  # ── Backend: clippy + fmt + check + test ──
-  backend:
-    name: Backend
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: "./src-tauri -> target"
-
-      - name: Cargo fmt
-        working-directory: src-tauri
-        run: cargo fmt --all -- --check
-
-      - name: Clippy (correctness gate)
-        working-directory: src-tauri
-        # Keep advisory warnings visible; compilation and correctness errors remain fatal.
-        run: cargo clippy --all-targets -- -D clippy::correctness
-
-      - name: Cargo test
-        working-directory: src-tauri
-        run: cargo test
-
-      - name: Clipboard HTML parser regressions
-        working-directory: src-tauri
-        run: cargo test -p clipboard-rs --lib html_tests
-
-  # ── E2E smoke tests (Playwright via Vite dev server) ──
-  e2e:
-    name: E2E
-    runs-on: windows-latest
-    needs: [frontend]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Install Playwright browsers
-        run: npx playwright install chromium
-
-      - name: Run E2E tests
-        run: npm run test:e2e
-
-  # ── Security audit ──
-  audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-          cache: npm
-
-      - name: npm audit
-        run: npm audit --audit-level=critical
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-
-      - name: Cargo audit
-        working-directory: src-tauri
-        run: cargo audit
+      - name: Verify app bundle
+        run: |
+          plutil -lint build/universal/ElegantClipbar.app/Contents/Info.plist
+          lipo build/universal/ElegantClipbar.app/Contents/MacOS/ElegantClipbar -verify_arch arm64 x86_64
+          codesign --verify --strict build/universal/ElegantClipbar.app

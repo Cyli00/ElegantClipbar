@@ -1,124 +1,107 @@
-name: Release
+name: Build macOS release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build-and-release:
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            rust-target: x86_64-pc-windows-msvc
-          - arch: arm64
-            rust-target: aarch64-pc-windows-msvc
-    runs-on: windows-latest
+  build:
+    name: Test and build universal macOS app
+    runs-on: macos-15
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
-      # Extract version from tag (v0.6.0 → 0.6.0)
-      - name: Extract version from tag
+      - name: Validate release version
         id: version
         shell: bash
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
-
-      # Sync version in package.json, tauri.conf.json, Cargo.toml
-      - name: Bump version to ${{ steps.version.outputs.VERSION }}
-        shell: pwsh
         run: |
-          $v = "${{ steps.version.outputs.VERSION }}"
-          $root = $env:GITHUB_WORKSPACE
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo 'Run this workflow against a version tag, such as v0.1.0.' >&2
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Release tags must use vx.y.z.' >&2
+            exit 1
+          fi
+          declared_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)
+          if [[ "$version" != "$declared_version" ]]; then
+            echo 'The release tag must match Resources/Info.plist.' >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-          # package.json
-          $pkgPath = Join-Path $root "package.json"
-          $pkg = Get-Content $pkgPath -Raw | ConvertFrom-Json
-          $pkg.version = $v
-          $pkg | ConvertTo-Json -Depth 10 | Set-Content $pkgPath -Encoding utf8NoBOM
+      - name: Swift Testing
+        run: make test
 
-          # src-tauri/tauri.conf.json
-          $tauriPath = Join-Path $root "src-tauri\tauri.conf.json"
-          $tauri = Get-Content $tauriPath -Raw | ConvertFrom-Json
-          $tauri.version = $v
-          $tauri | ConvertTo-Json -Depth 10 | Set-Content $tauriPath -Encoding utf8NoBOM
-
-          # src-tauri/Cargo.toml
-          $cargoPath = Join-Path $root "src-tauri\Cargo.toml"
-          $cargo = Get-Content $cargoPath -Raw
-          $cargo = $cargo -replace '(?m)^(version\s*=\s*")[^"]*(")', "`${1}$v`${2}"
-          Set-Content $cargoPath $cargo -Encoding utf8NoBOM -NoNewline
-
-          Write-Host "Version synced to $v in all 3 files"
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-          cache: npm
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust-target }}
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: "./src-tauri -> target"
-          key: ${{ matrix.arch }}
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build and release
-        uses: tauri-apps/tauri-action@v0
+      - name: Package Apple Silicon and Intel app
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          UPDATER_GITHUB_TOKEN: ${{ secrets.UPDATER_TOKEN }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "ElegantClipboard ${{ github.ref_name }}"
-          releaseBody: "See the assets to download and install."
-          releaseDraft: true
-          prerelease: false
-          args: --target ${{ matrix.rust-target }}
+          APP_VERSION: ${{ steps.version.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: make universal
 
-      - name: Rename portable exe
-        shell: pwsh
+      - name: Verify app bundle
         run: |
-          $v = "${{ steps.version.outputs.VERSION }}"
-          $arch = "${{ matrix.arch }}"
-          $src = "src-tauri/target/${{ matrix.rust-target }}/release/elegant-clipboard.exe"
-          Copy-Item $src "ElegantClipboard_${v}_${arch}_portable.exe"
+          plutil -lint build/universal/ElegantClipbar.app/Contents/Info.plist
+          lipo build/universal/ElegantClipbar.app/Contents/MacOS/ElegantClipbar -verify_arch arm64 x86_64
+          codesign --verify --strict build/universal/ElegantClipbar.app
+          test -s build/universal/ElegantClipbar.app/Contents/Resources/AppIcon.icns
+          test -s build/universal/ElegantClipbar.app/Contents/Resources/BrandIcon.png
+          test -s build/universal/ElegantClipbar.app/Contents/Resources/StatusIconTemplate.png
 
-      - name: Upload portable artifact
+      - name: Archive app and checksum
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          archive="ElegantClipbar-${APP_VERSION}-macOS-universal.zip"
+          ditto -c -k --sequesterRsrc --keepParent build/universal/ElegantClipbar.app "build/$archive"
+          cd build
+          shasum -a 256 "$archive" > "$archive.sha256"
+
+      - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: portable-${{ matrix.arch }}
-          path: ElegantClipboard_*_portable.exe
+          name: ElegantClipbar-${{ steps.version.outputs.version }}-macOS-universal
+          path: |
+            build/ElegantClipbar-*.zip
+            build/ElegantClipbar-*.zip.sha256
+          if-no-files-found: error
 
-  upload-portable:
-    needs: build-and-release
-    runs-on: windows-latest
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - name: Download portable artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          pattern: portable-*
-          path: ./portables
-          merge-multiple: true
+          name: ElegantClipbar-${{ needs.build.outputs.version }}-macOS-universal
+          path: release-assets
 
-      - name: Upload portable to release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          draft: true
-          files: portables/*
+      - name: Verify checksum
+        working-directory: release-assets
+        run: sha256sum --check *.sha256
+
+      - name: Publish release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --verify-tag --title "ElegantClipbar $RELEASE_TAG" \
+            --generate-notes --latest \
+            --notes 'Native macOS clipboard app for macOS 13 or later, supporting Apple Silicon and Intel. This build is ad-hoc signed and is not notarized. Native history starts empty; legacy Windows backups are unsupported.'
